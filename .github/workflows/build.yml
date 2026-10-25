@@ -3564,6 +3564,7 @@ jobs:
               @Published var anchor: UnitPoint = .center
               @Published var spotlight = false
               var iconFrames: [AppID: CGRect] = [:]
+              @Published var safeTop: CGFloat = 59
               var screen: CGSize = CGSize(width: 393, height: 852)
 
               static let launch = Animation.spring(response: 0.42, dampingFraction: 0.86)
@@ -3610,6 +3611,12 @@ jobs:
               @StateObject private var store = ChatStore()
               @StateObject private var nav = PhoneNav()
               @State private var feathers = false
+              @State private var systemScheme: ColorScheme = PhoneRoot.currentSystemScheme()
+
+              // The phone's own appearance setting (not the app's override).
+              static func currentSystemScheme() -> ColorScheme {
+                  UIScreen.main.traitCollection.userInterfaceStyle == .dark ? .dark : .light
+              }
 
               @ViewBuilder var appView: some View {
                   switch nav.app {
@@ -3668,8 +3675,14 @@ jobs:
                               .zIndex(5)
                           }
                       }
-                      .onAppear { nav.screen = geo.size }
-                      .onChange(of: geo.size) { s in nav.screen = s }
+                      .onAppear {
+                          nav.screen = geo.size
+                          nav.safeTop = geo.safeAreaInsets.top
+                      }
+                      .onChange(of: geo.size) { s in
+                          nav.screen = s
+                          nav.safeTop = geo.safeAreaInsets.top
+                      }
                   }
                   .overlay(alignment: .top) {
                       if let b = store.banner, !nav.locked {
@@ -3684,11 +3697,16 @@ jobs:
                       }
                   }
                   .overlay(alignment: .top) {
-                      if onSpringboard { FakeStatusBar(showTime: !nav.locked).ignoresSafeArea() }
+                      if nav.locked { FakeStatusBar(top: nav.safeTop).ignoresSafeArea() }
                   }
                   .animation(.spring(response: 0.45, dampingFraction: 0.82), value: store.banner)
                   .animation(.spring(response: 0.5, dampingFraction: 0.9), value: nav.locked)
-                  .statusBarHidden(onSpringboard)
+                  .statusBarHidden(nav.locked)
+                  // Home and Lock Screen sit on a dark wallpaper, so the real status bar must be white there.
+                  .preferredColorScheme(onSpringboard ? .dark : systemScheme)
+                  .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                      systemScheme = PhoneRoot.currentSystemScheme()
+                  }
                   .persistentSystemOverlays(.hidden)
                   .defersSystemGestures(on: .bottom)
                   .onChange(of: store.flags.contains("hill_open")) { open in
@@ -3777,7 +3795,8 @@ jobs:
           }
 
           struct FakeStatusBar: View {
-              var showTime = true
+              let top: CGFloat
+              var carrier = "Whisper"
               @State private var level = 100
               @State private var charging = false
 
@@ -3789,27 +3808,27 @@ jobs:
               }
 
               var body: some View {
+                  // The real status bar's items sit in the "ears" beside the Dynamic Island,
+                  // vertically centred in the top safe area.
                   GeometryReader { g in
                       let ear = max(0, g.size.width / 2 - 64)
-                      let barHeight = max(g.safeAreaInsets.top, 24)
-                      TimelineView(.everyMinute) { ctx in
-                          HStack(spacing: 0) {
-                              Text(showTime ? ctx.date.fmt("h:mm") : "")
-                                  .font(.system(size: 17, weight: .semibold))
-                                  .frame(width: ear)
-                              Spacer(minLength: 0)
-                              HStack(spacing: 6) {
-                                  Image(systemName: "cellularbars").font(.system(size: 15, weight: .semibold))
-                                  Image(systemName: "wifi").font(.system(size: 15, weight: .semibold))
-                                  BatteryGlyph(level: level, charging: charging)
-                              }
-                              .frame(width: ear)
+                      HStack(spacing: 0) {
+                          HStack(spacing: 5) {
+                              Text(carrier).font(.system(size: 17, weight: .semibold))
                           }
-                          .foregroundStyle(.white)
-                          .frame(height: barHeight)
+                          .frame(width: ear)
+                          Spacer(minLength: 0)
+                          HStack(spacing: 6) {
+                              Image(systemName: "cellularbars").font(.system(size: 15, weight: .semibold))
+                              Image(systemName: "wifi").font(.system(size: 15, weight: .semibold))
+                              BatteryGlyph(level: level, charging: charging)
+                          }
+                          .frame(width: ear)
                       }
+                      .foregroundStyle(.white)
+                      .frame(height: max(top, 44))
                   }
-                  .frame(height: 60)
+                  .frame(height: max(top, 44))
                   .allowsHitTesting(false)
                   .onAppear(perform: readBattery)
                   .onReceive(NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification)) { _ in readBattery() }
@@ -3849,9 +3868,10 @@ jobs:
               @EnvironmentObject var nav: PhoneNav
               @State private var drag: CGFloat = 0
               @State private var torch = false
+              @State private var hint = false
 
               var notifications: [Conversation] {
-                  Array(store.sorted.filter { $0.unread && !($0.messages.last?.isMe ?? true) }.prefix(4))
+                  Array(store.sorted.filter { $0.unread && !($0.messages.last?.isMe ?? true) }.prefix(3))
               }
 
               func toggleTorch() {
@@ -3863,84 +3883,135 @@ jobs:
                   d.unlockForConfiguration()
               }
 
-              func dawnLine(_ now: Date) -> String {
-                  if store.isEnded { return "Dawn has come" }
-                  if store.flags.contains("tam_song") { return "Dawn delayed" }
+              func minutesToDawn(_ now: Date) -> Int {
                   let cal = Calendar.current
                   var dawn = cal.date(bySettingHour: 6, minute: 14, second: 0, of: now) ?? now
                   if dawn <= now { dawn = cal.date(byAdding: .day, value: 1, to: dawn) ?? dawn }
-                  let mins = Int(dawn.timeIntervalSince(now) / 60)
-                  return "Dawn in \(mins / 60)h \(mins % 60)m"
+                  return Int(dawn.timeIntervalSince(now) / 60)
               }
 
-              func glassCircle(_ symbol: String, on: Bool, action: @escaping () -> Void) -> some View {
+              func showHint() {
+                  withAnimation(.easeInOut(duration: 0.25)) { hint = true }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
+                      withAnimation(.easeInOut(duration: 0.25)) { hint = false }
+                  }
+              }
+
+              // The big iOS 26/27 Lock Screen clock: tall, thin, condensed numerals with a glassy rim.
+              func clock(_ date: Date) -> some View {
+                  let digits = date.fmt("h:mm")
+                  let face = Text(digits)
+                      .font(.system(size: 250, weight: .ultraLight))
+                      .fontWidth(.compressed)
+                  return face
+                      .foregroundStyle(LinearGradient(colors: [Color.white.opacity(0.62), Color.white.opacity(0.38)],
+                                                      startPoint: .top, endPoint: .bottom))
+                      .overlay(
+                          face
+                              .foregroundStyle(LinearGradient(colors: [Color.white.opacity(0.9), Color.white.opacity(0)],
+                                                              startPoint: .top, endPoint: .center))
+                              .offset(x: -0.6, y: -1.2)
+                              .mask(face)
+                      )
+                      .shadow(color: .black.opacity(0.55), radius: 1.5, x: 0.8, y: 1.6)
+                      .lineLimit(1)
+                      .minimumScaleFactor(0.4)
+                      .frame(maxWidth: 330, maxHeight: 210)
+              }
+
+              func roundButton(_ symbol: String, on: Bool, action: @escaping () -> Void) -> some View {
                   Button(action: action) {
                       Image(systemName: symbol)
-                          .font(.system(size: 21, weight: .medium))
+                          .font(.system(size: 22, weight: .medium))
                           .foregroundStyle(on ? Color.black : Color.white)
-                          .frame(width: 50, height: 50)
-                          .background(Circle().fill(on ? Color.white : Color.clear))
+                          .frame(width: 54, height: 54)
+                          .background(Circle().fill(on ? Color.white : Color.black.opacity(0.35)))
                           .glass(Circle())
                   }
                   .buttonStyle(PressableStyle())
               }
 
+              var widgets: some View {
+                  TimelineView(.everyMinute) { ctx in
+                      let mins = minutesToDawn(ctx.date)
+                      HStack(spacing: 36) {
+                          // Dawn countdown ring (accessoryCircular style).
+                          ZStack {
+                              Circle().stroke(Color.white.opacity(0.25), lineWidth: 4)
+                              Circle()
+                                  .trim(from: 0, to: store.isEnded ? 1 : CGFloat(max(0, 1 - Double(mins) / 480)))
+                                  .stroke(Color.white, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                                  .rotationEffect(.degrees(-90))
+                              VStack(spacing: -1) {
+                                  Image(systemName: store.flags.contains("tam_song") ? "cloud.fill" : "moon.fill")
+                                      .font(.system(size: 13, weight: .semibold))
+                                  Text(store.isEnded ? "6:14" : "\(mins / 60):\(String(format: "%02d", mins % 60))")
+                                      .font(.system(size: 13, weight: .semibold))
+                              }
+                          }
+                          .frame(width: 52, height: 52)
+                          // Weather (accessoryRectangular style).
+                          VStack(alignment: .leading, spacing: 1) {
+                              HStack(spacing: 4) {
+                                  Image(systemName: store.flags.contains("tam_song") ? "cloud.fill" : "cloud.moon.fill")
+                                  Text(store.flags.contains("tam_song") ? "9°" : "11°")
+                              }
+                              .font(.system(size: 19, weight: .semibold))
+                              Text("↑13  ↓7").font(.system(size: 13, weight: .semibold))
+                          }
+                      }
+                      .foregroundStyle(.white)
+                  }
+              }
+
               var body: some View {
                   ZStack {
                       Wallpaper()
+                      LinearGradient(colors: [Color.black.opacity(0.25), Color.clear, Color.black.opacity(0.35)],
+                                     startPoint: .top, endPoint: .bottom)
+                          .ignoresSafeArea()
                       VStack(spacing: 0) {
-                          Image(systemName: "lock.fill")
-                              .font(.system(size: 17, weight: .semibold))
-                              .foregroundStyle(.white)
-                              .padding(.top, 4)
                           TimelineView(.everyMinute) { ctx in
-                              VStack(spacing: -6) {
-                                  HStack(spacing: 6) {
-                                      Text(ctx.date.fmt("EEEE, MMMM d"))
-                                      Text("·").opacity(0.6)
-                                      Image(systemName: store.flags.contains("tam_song") ? "cloud.fill" : "moon.stars.fill")
-                                      Text(dawnLine(ctx.date))
-                                  }
-                                  .font(.system(size: 18, weight: .semibold))
-                                  .opacity(0.88)
-                                  Text(ctx.date.fmt("h:mm"))
-                                      .font(.system(size: 108, weight: .semibold))
-                                      .kerning(-3)
-                                      .foregroundStyle(LinearGradient(colors: [Color.white.opacity(0.98), Color.white.opacity(0.78)],
-                                                                      startPoint: .top, endPoint: .bottom))
-                                      .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+                              VStack(spacing: 0) {
+                                  Image(systemName: "lock.fill")
+                                      .font(.system(size: 15, weight: .semibold))
+                                      .padding(.bottom, 10)
+                                  Text(hint ? "Swipe up to unlock" : ctx.date.fmt("EEEE, MMMM d"))
+                                      .font(.system(size: 21, weight: .semibold))
+                                      .contentTransition(.opacity)
+                                  clock(ctx.date)
+                                      .padding(.top, -6)
                               }
+                              .foregroundStyle(.white)
                           }
-                          .foregroundStyle(.white)
-                          .padding(.top, 10)
-                          Spacer()
+                          Spacer(minLength: 8)
                           VStack(spacing: 8) {
                               ForEach(notifications) { c in
                                   Button { nav.openChat(c.id) } label: { LockNotification(convo: c) }
                                       .buttonStyle(PressableStyle())
                               }
                           }
-                          .padding(.horizontal, 10)
+                          .padding(.horizontal, 12)
+                          widgets
+                              .padding(.top, 22)
                           HStack {
-                              glassCircle(torch ? "flashlight.on.fill" : "flashlight.off.fill", on: torch, action: toggleTorch)
+                              roundButton(torch ? "flashlight.on.fill" : "flashlight.off.fill", on: torch, action: toggleTorch)
                               Spacer()
-                              Text("Swipe up to open")
-                                  .font(.system(size: 15, weight: .medium))
-                                  .foregroundStyle(.white.opacity(0.7))
-                              Spacer()
-                              glassCircle("camera.fill", on: false) {
+                              roundButton("camera.fill", on: false) {
                                   UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                                  showHint()
                               }
                           }
-                          .padding(.horizontal, 44)
-                          .padding(.top, 20)
-                          .padding(.bottom, 28)
+                          .padding(.horizontal, 48)
+                          .padding(.top, 26)
+                          .padding(.bottom, 44)
                       }
-                      .padding(.top, 50)
+                      .padding(.top, 8)
                   }
                   .environment(\.colorScheme, .dark)
                   .offset(y: min(0, drag))
                   .contentShape(Rectangle())
+                  .onTapGesture(perform: showHint)
                   .gesture(
                       DragGesture(minimumDistance: 12)
                           .onChanged { v in drag = v.translation.height }
@@ -3959,24 +4030,25 @@ jobs:
               let convo: Conversation
 
               var body: some View {
-                  HStack(alignment: .center, spacing: 11) {
+                  HStack(alignment: .center, spacing: 12) {
                       ZStack(alignment: .bottomTrailing) {
-                          Avatar(convo: convo, size: 40)
-                          MiniMessagesBadge().offset(x: 3, y: 3)
+                          Avatar(convo: convo, size: 42)
+                          MiniMessagesBadge().offset(x: 4, y: 4)
                       }
                       VStack(alignment: .leading, spacing: 1) {
-                          HStack {
-                              Text(convo.name).font(.system(size: 15, weight: .semibold))
+                          HStack(alignment: .firstTextBaseline) {
+                              Text(convo.name).font(.system(size: 16, weight: .semibold))
                               Spacer()
-                              Text(convo.lastDate.listLabel()).font(.system(size: 13)).opacity(0.65)
+                              Text(convo.lastDate.listLabel()).font(.system(size: 13)).opacity(0.55)
                           }
-                          Text(convo.preview).font(.system(size: 15)).lineLimit(2).multilineTextAlignment(.leading)
+                          Text(convo.preview).font(.system(size: 16)).lineLimit(2).multilineTextAlignment(.leading)
                       }
                   }
                   .foregroundStyle(.white)
-                  .padding(.horizontal, 14)
-                  .padding(.vertical, 12)
-                  .background(Material.ultraThin.opacity(0.9), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                  .padding(.horizontal, 16)
+                  .padding(.vertical, 14)
+                  .background(RoundedRectangle(cornerRadius: 26, style: .continuous).fill(Color(hex: 0x1C1C1E).opacity(0.82)))
+                  .glass(RoundedRectangle(cornerRadius: 26, style: .continuous))
                   .environment(\.colorScheme, .dark)
               }
           }
@@ -4117,7 +4189,7 @@ jobs:
               func label(_ s: String, _ x: CGFloat, _ y: CGFloat, _ g: GeometryProxy, dot: Bool = true) -> some View {
                   HStack(spacing: 3) {
                       if dot { Circle().stroke(Color.white, lineWidth: 1.5).frame(width: 6, height: 6) }
-                      Text(s).font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
+                      Text(s).font(.system(size: 12, weight: .bold)).foregroundStyle(.white).lineLimit(1).fixedSize()
                           .shadow(color: .black.opacity(0.6), radius: 2)
                   }
                   .position(x: g.size.width * x, y: g.size.height * y)
@@ -4145,7 +4217,7 @@ jobs:
                           }
                           label("Blackfell", 0.22, 0.24, g)
                           label("Harrowmere", 0.62, 0.36, g)
-                          label("Gull's Rest", 0.8, 0.58, g)
+                          label("Gull's Rest", 0.7, 0.64, g)
                           ZStack {
                               Circle().fill(Color.white).frame(width: 24, height: 24)
                               Image(systemName: "location.fill").font(.system(size: 11, weight: .bold)).foregroundStyle(imBlue)
@@ -5038,7 +5110,7 @@ jobs:
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.example.messagesclone
-                  PRODUCT_NAME: Messages
+                  PRODUCT_NAME: EyeMessage
                   SWIFT_VERSION: "5.0"
                   ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
                   GENERATE_INFOPLIST_FILE: YES
@@ -5138,10 +5210,10 @@ jobs:
       - name: Package IPA
         run: |
           mkdir Payload
-          cp -R build/Build/Products/Release-iphoneos/Messages.app Payload/
-          zip -qr Messages.ipa Payload
+          cp -R build/Build/Products/Release-iphoneos/EyeMessage.app Payload/
+          zip -qr EyeMessage.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Messages-ipa
-          path: Messages.ipa
+          name: EyeMessage
+          path: EyeMessage.ipa

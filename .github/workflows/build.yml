@@ -765,6 +765,88 @@ jobs:
                   .tint(.orange)
               }
           }
+
+          // MARK: Contacts
+
+          struct ContactsApp: View {
+              @EnvironmentObject var store: ChatStore
+              @EnvironmentObject var nav: PhoneNav
+              @State private var q = ""
+
+              var people: [Conversation] {
+                  store.conversations
+                      .filter { q.isEmpty || $0.name.localizedCaseInsensitiveContains(q) }
+                      .sorted { $0.name < $1.name }
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          Section {
+                              HStack(spacing: 14) {
+                                  Avatar(emoji: "", c1: 0x8E8E93, c2: 0x5A5A5F, initials: "IV", size: 56)
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      Text("Ilsabet Vesper").font(.system(size: 20, weight: .semibold))
+                                      Text("My Card").font(.system(size: 14)).foregroundStyle(.secondary)
+                                  }
+                              }
+                              .padding(.vertical, 4)
+                          }
+                          Section {
+                              ForEach(people) { c in
+                                  NavigationLink {
+                                      ContactCard(convo: c)
+                                  } label: {
+                                      HStack(spacing: 12) {
+                                          Avatar(convo: c, size: 36)
+                                          Text(c.name)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      .searchable(text: $q)
+                      .navigationTitle("Contacts")
+                  }
+              }
+          }
+
+          struct ContactCard: View {
+              @EnvironmentObject var nav: PhoneNav
+              let convo: Conversation
+
+              var note: String { Roles.all[convo.key]?.note ?? "" }
+
+              var body: some View {
+                  ScrollView {
+                      VStack(spacing: 14) {
+                          Avatar(convo: convo, size: 110).padding(.top, 10)
+                          Text(convo.name).font(.system(size: 28, weight: .semibold))
+                          Button {
+                              nav.openChat(convo.id)
+                          } label: {
+                              Label("Message", systemImage: "message.fill")
+                                  .frame(maxWidth: .infinity)
+                                  .padding(.vertical, 4)
+                          }
+                          .buttonStyle(.borderedProminent)
+                          .padding(.horizontal)
+                          if !note.isEmpty {
+                              VStack(alignment: .leading, spacing: 6) {
+                                  Text("Notes").font(.system(size: 13)).foregroundStyle(.secondary)
+                                  Text(note).font(.system(size: 17))
+                              }
+                              .frame(maxWidth: .infinity, alignment: .leading)
+                              .padding()
+                              .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
+                              .padding(.horizontal)
+                          }
+                      }
+                  }
+                  .background(Color(.systemGroupedBackground))
+                  .navigationBarTitleDisplayMode(.inline)
+              }
+          }
           EOF
           cat > App/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF'
           {
@@ -3217,7 +3299,7 @@ jobs:
           import AVFoundation
 
           enum AppID: String {
-              case home, messages, phone, notes, calendar, weather, settings, clock
+              case home, messages, phone, notes, calendar, weather, settings, clock, contacts
           }
 
           @MainActor
@@ -3284,6 +3366,7 @@ jobs:
                   case .weather: WeatherApp()
                   case .settings: SettingsApp()
                   case .clock: ClockApp()
+                  case .contacts: ContactsApp()
                   case .home: EmptyView()
                   }
               }
@@ -3320,6 +3403,16 @@ jobs:
                                   .transition(.opacity)
                                   .zIndex(4)
                           }
+                          // Real iOS hides the home indicator on the Home Screen; it shows on the Lock Screen and in apps.
+                          if nav.locked || nav.app != .home {
+                              HomeIndicator(light: nav.locked || nav.app == .weather) {
+                                  if nav.locked { nav.unlock() } else { nav.goHome() }
+                              }
+                              .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                              .ignoresSafeArea()
+                              .transition(.opacity)
+                              .zIndex(5)
+                          }
                       }
                       .onAppear { nav.screen = geo.size }
                       .onChange(of: geo.size) { s in nav.screen = s }
@@ -3338,11 +3431,6 @@ jobs:
                   }
                   .overlay(alignment: .top) {
                       if onSpringboard { FakeStatusBar(showTime: !nav.locked).ignoresSafeArea() }
-                  }
-                  .overlay(alignment: .bottom) {
-                      HomeIndicator(light: onSpringboard || nav.app == .weather) {
-                          if nav.locked { nav.unlock() } else { nav.goHome() }
-                      }
                   }
                   .animation(.spring(response: 0.45, dampingFraction: 0.82), value: store.banner)
                   .animation(.spring(response: 0.5, dampingFraction: 0.9), value: nav.locked)
@@ -3679,11 +3767,12 @@ jobs:
               var fg: Color = .white
               var badge: Int = 0
               var label = true
+              var size: CGFloat = 62
 
               var body: some View {
                   Button { nav.open(app) } label: {
                       VStack(spacing: 6) {
-                          IconTile(symbol: symbol, colors: colors, fg: fg)
+                          IconTile(symbol: symbol, colors: colors, fg: fg, size: size)
                               .overlay(alignment: .topTrailing) {
                                   if badge > 0 {
                                       Text("\(badge)")
@@ -3714,76 +3803,179 @@ jobs:
               }
           }
 
-          struct WidgetBox<Content: View>: View {
-              let title: String
-              @ViewBuilder let content: Content
+          // Widgets follow the real iOS grid: on a 393pt-wide phone a small widget is 158x158,
+          // a medium one 338x158, with 27pt side margins and 22pt gutters.
+          struct HomeMetrics {
+              let width: CGFloat
+              var margin: CGFloat { (width * 0.0687).rounded() }
+              var gutter: CGFloat { (width * 0.056).rounded() }
+              var small: CGFloat { ((width - margin * 2 - gutter) / 2).rounded(.down) }
+              var medium: CGFloat { width - margin * 2 }
+              var icon: CGFloat { (width * 0.158).rounded() }
+          }
+
+          struct WidgetGlass: ViewModifier {
+              func body(content: Content) -> some View {
+                  content
+                      .background(
+                          RoundedRectangle(cornerRadius: 24, style: .continuous)
+                              .fill(Color(hex: 0x1C1C1E).opacity(0.72))
+                      )
+                      .glass(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                      .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 24, style: .continuous)
+                              .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                      )
+              }
+          }
+
+          // A little radar-style map of Harrowmere for the weather widget.
+          struct CoastShape: Shape {
+              func path(in r: CGRect) -> Path {
+                  var p = Path()
+                  let w = r.width, h = r.height
+                  p.move(to: CGPoint(x: 0, y: 0))
+                  p.addLine(to: CGPoint(x: w * 0.56, y: 0))
+                  p.addCurve(to: CGPoint(x: w * 0.47, y: h * 0.34), control1: CGPoint(x: w * 0.6, y: h * 0.12), control2: CGPoint(x: w * 0.42, y: h * 0.2))
+                  p.addCurve(to: CGPoint(x: w * 0.68, y: h * 0.5), control1: CGPoint(x: w * 0.55, y: h * 0.42), control2: CGPoint(x: w * 0.7, y: h * 0.4))
+                  p.addCurve(to: CGPoint(x: w * 0.5, y: h * 0.62), control1: CGPoint(x: w * 0.66, y: h * 0.58), control2: CGPoint(x: w * 0.54, y: h * 0.55))
+                  p.addCurve(to: CGPoint(x: w * 0.42, y: h), control1: CGPoint(x: w * 0.44, y: h * 0.75), control2: CGPoint(x: w * 0.47, y: h * 0.9))
+                  p.addLine(to: CGPoint(x: 0, y: h))
+                  p.closeSubpath()
+                  return p
+              }
+          }
+
+          struct HarrowmereMap: View {
+              let cloudy: Bool
+
+              func label(_ s: String, _ x: CGFloat, _ y: CGFloat, _ g: GeometryProxy, dot: Bool = true) -> some View {
+                  HStack(spacing: 3) {
+                      if dot { Circle().stroke(Color.white, lineWidth: 1.5).frame(width: 6, height: 6) }
+                      Text(s).font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
+                          .shadow(color: .black.opacity(0.6), radius: 2)
+                  }
+                  .position(x: g.size.width * x, y: g.size.height * y)
+              }
 
               var body: some View {
-                  VStack(spacing: 6) {
-                      content
-                          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                          .padding(15)
-                          .aspectRatio(1, contentMode: .fit)
-                          .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                          .shadow(color: .black.opacity(0.25), radius: 10, y: 5)
-                      Text(title)
-                          .font(.system(size: 12))
-                          .foregroundStyle(.white)
-                          .shadow(color: .black.opacity(0.35), radius: 2)
+                  GeometryReader { g in
+                      ZStack {
+                          Color(hex: 0x23408E)
+                          CoastShape().fill(Color(hex: 0x2F6B4F))
+                          CoastShape().stroke(Color(hex: 0x9FC6B0).opacity(0.5), lineWidth: 1)
+                          // moor contour lines
+                          Path { p in
+                              p.move(to: CGPoint(x: 0, y: g.size.height * 0.2))
+                              p.addCurve(to: CGPoint(x: g.size.width * 0.4, y: g.size.height * 0.15),
+                                         control1: CGPoint(x: g.size.width * 0.15, y: g.size.height * 0.3),
+                                         control2: CGPoint(x: g.size.width * 0.3, y: g.size.height * 0.05))
+                              p.move(to: CGPoint(x: 0, y: g.size.height * 0.72))
+                              p.addLine(to: CGPoint(x: g.size.width * 0.46, y: g.size.height * 0.7))
+                          }
+                          .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                          if cloudy {
+                              RadialGradient(colors: [Color.white.opacity(0.55), .clear], center: UnitPoint(x: 0.75, y: 0.3), startRadius: 4, endRadius: 90)
+                              RadialGradient(colors: [Color.white.opacity(0.4), .clear], center: UnitPoint(x: 0.35, y: 0.75), startRadius: 4, endRadius: 70)
+                          }
+                          label("Blackfell", 0.22, 0.24, g)
+                          label("Harrowmere", 0.62, 0.36, g)
+                          label("Gull's Rest", 0.8, 0.58, g)
+                          ZStack {
+                              Circle().fill(Color.white).frame(width: 24, height: 24)
+                              Image(systemName: "location.fill").font(.system(size: 11, weight: .bold)).foregroundStyle(imBlue)
+                          }
+                          .position(x: g.size.width * 0.5, y: g.size.height * 0.5)
+                          TimelineView(.everyMinute) { ctx in
+                              Text("at " + Date(timeIntervalSince1970: (ctx.date.timeIntervalSince1970 / 900).rounded(.down) * 900).fmt("h:mm a"))
+                                  .font(.system(size: 13, weight: .semibold))
+                                  .foregroundStyle(.white)
+                                  .padding(.horizontal, 8)
+                                  .padding(.vertical, 3)
+                                  .background(Capsule().fill(Color.black.opacity(0.55)))
+                                  .position(x: g.size.width * 0.5, y: g.size.height - 16)
+                          }
+                      }
                   }
+                  .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
               }
           }
 
           struct WeatherWidget: View {
               @EnvironmentObject var store: ChatStore
+              let m: HomeMetrics
               var cloudy: Bool { store.flags.contains("tam_song") }
 
               var body: some View {
-                  VStack(alignment: .leading, spacing: 2) {
-                      HStack(spacing: 3) {
-                          Text("Harrowmere").font(.system(size: 15, weight: .semibold))
-                          Image(systemName: "location.fill").font(.system(size: 9))
+                  HStack(spacing: 12) {
+                      VStack(alignment: .leading, spacing: 6) {
+                          HStack(alignment: .top) {
+                              Image(systemName: cloudy ? "cloud.fill" : "cloud.moon.fill")
+                                  .symbolRenderingMode(.multicolor)
+                                  .font(.system(size: 30))
+                              Text(cloudy ? "9°" : "11°").font(.system(size: 40, weight: .semibold))
+                              Spacer(minLength: 0)
+                              VStack(alignment: .trailing, spacing: 0) {
+                                  Label("13°", systemImage: "arrow.up").labelStyle(TightLabel())
+                                  Label("7°", systemImage: "arrow.down").labelStyle(TightLabel())
+                              }
+                              .font(.system(size: 14, weight: .semibold))
+                          }
+                          (Text("Harrowmere: ").fontWeight(.bold) +
+                           Text(cloudy ? "Thick cloud bank over the east. Sunrise delayed." : "Clear, with crows. Unusual numbers over Crooked Gate."))
+                              .font(.system(size: 15))
+                              .lineLimit(4)
+                          Spacer(minLength: 0)
                       }
-                      Text(cloudy ? "9°" : "11°").font(.system(size: 42, weight: .light))
-                      Spacer(minLength: 0)
-                      Image(systemName: cloudy ? "cloud.fill" : "moon.stars.fill")
-                          .symbolRenderingMode(.multicolor)
-                          .font(.system(size: 16))
-                      Text(cloudy ? "Thick Cloud" : "Crows").font(.system(size: 13, weight: .semibold))
-                      Text("H:13°  L:7°").font(.system(size: 13, weight: .medium))
+                      HarrowmereMap(cloudy: cloudy)
+                          .frame(width: m.small - 30)
                   }
                   .foregroundStyle(.white)
-                  .background(
-                      LinearGradient(colors: cloudy ? [Color(hex: 0x6B7686), Color(hex: 0x3A424E)] : [Color(hex: 0x1F3A7A), Color(hex: 0x0D1736)],
-                                     startPoint: .top, endPoint: .bottom)
-                          .padding(-15)
-                  )
+                  .padding(15)
+                  .frame(width: m.medium, height: m.small)
+                  .modifier(WidgetGlass())
+              }
+          }
+
+          struct TightLabel: LabelStyle {
+              func makeBody(configuration: Configuration) -> some View {
+                  HStack(spacing: 2) {
+                      configuration.icon.font(.system(size: 11, weight: .bold)).opacity(0.7)
+                      configuration.title
+                  }
               }
           }
 
           struct CalendarWidget: View {
-              var next: CalEvent? {
-                  Lore.calendar.filter { $0.date > Date() }.sorted { $0.date < $1.date }.first
+              let m: HomeMetrics
+              var upcoming: [CalEvent] {
+                  Array(Lore.calendar.filter { $0.date > Date() }.sorted { $0.date < $1.date }.prefix(2))
               }
 
               var body: some View {
                   TimelineView(.everyMinute) { ctx in
-                      VStack(alignment: .leading, spacing: 2) {
+                      VStack(alignment: .leading, spacing: 0) {
                           Text(ctx.date.fmt("EEEE").uppercased())
-                              .font(.system(size: 12, weight: .semibold)).foregroundStyle(Color(hex: 0xFF3B30))
-                          Text(ctx.date.fmt("d")).font(.system(size: 38, weight: .regular)).foregroundStyle(.black)
-                          Spacer(minLength: 0)
-                          if let e = next {
+                              .font(.system(size: 12, weight: .bold)).foregroundStyle(Color(hex: 0xFF453A))
+                          Text(ctx.date.fmt("d")).font(.system(size: 34, weight: .regular)).foregroundStyle(.white)
+                          Spacer(minLength: 4)
+                          ForEach(upcoming) { e in
                               HStack(alignment: .top, spacing: 6) {
-                                  RoundedRectangle(cornerRadius: 1.5).fill(Color(hex: e.color)).frame(width: 3, height: 32)
-                                  VStack(alignment: .leading, spacing: 1) {
-                                      Text(e.title).font(.system(size: 13, weight: .semibold)).foregroundStyle(.black).lineLimit(1)
-                                      Text(e.date.fmt("h:mm a")).font(.system(size: 12)).foregroundStyle(.gray)
+                                  RoundedRectangle(cornerRadius: 1.5).fill(Color(hex: e.color == 0x1C1C3A ? 0x8E8EF5 : e.color))
+                                      .frame(width: 3, height: 30)
+                                  VStack(alignment: .leading, spacing: 0) {
+                                      Text(e.title).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                                      Text(e.date.fmt("h:mm a")).font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
                                   }
                               }
+                              .padding(.top, 3)
                           }
                       }
-                      .background(Color.white.padding(-15))
+                      .frame(maxWidth: .infinity, alignment: .leading)
+                      .padding(15)
+                      .frame(width: m.small, height: m.small)
+                      .modifier(WidgetGlass())
                   }
               }
           }
@@ -3801,65 +3993,74 @@ jobs:
               let gray = [Color(hex: 0xA2A2A8), Color(hex: 0x6C6C72)]
               let blue = [Color(hex: 0x5AB0FF), Color(hex: 0x1E6BDB)]
               let dark = [Color(hex: 0x3A3A3C), Color(hex: 0x111112)]
+              let contactsGray = [Color(hex: 0xD5D5DA), Color(hex: 0xA9A9B0)]
 
-              var widgets: some View {
-                  HStack(spacing: 22) {
-                      Button { nav.open(.weather) } label: { WidgetBox(title: "Weather") { WeatherWidget() } }
-                          .buttonStyle(PressableStyle())
-                      Button { nav.open(.calendar) } label: { WidgetBox(title: "Calendar") { CalendarWidget() } }
-                          .buttonStyle(PressableStyle())
+              func iconBlock(_ m: HomeMetrics) -> some View {
+                  let gap = m.small - m.icon * 2
+                  return VStack(spacing: max(gap - 20, 8)) {
+                      HStack(spacing: gap) {
+                          HomeIcon(app: .clock, title: "Clock", symbol: "clock.fill", colors: dark, size: m.icon)
+                          HomeIcon(app: .weather, title: "Weather", symbol: "cloud.moon.fill", colors: blue, size: m.icon)
+                      }
+                      HStack(spacing: gap) {
+                          HomeIcon(app: .contacts, title: "Contacts", symbol: "person.crop.circle.fill", colors: contactsGray, fg: Color(hex: 0x6E6E73), size: m.icon)
+                          HomeIcon(app: .calendar, title: "Calendar", symbol: "calendar", colors: [Color.white, Color(hex: 0xECECEC)], fg: Color(hex: 0xFF3B30), size: m.icon)
+                      }
                   }
-              }
-
-              var grid: some View {
-                  LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 24) {
-                      HomeIcon(app: .clock, title: "Clock", symbol: "clock.fill", colors: dark)
-                      HomeIcon(app: .weather, title: "Weather", symbol: "cloud.moon.fill", colors: blue)
-                      HomeIcon(app: .calendar, title: "Calendar", symbol: "calendar", colors: [Color.white, Color(hex: 0xECECEC)], fg: Color(hex: 0xFF3B30))
-                      HomeIcon(app: .settings, title: "Settings", symbol: "gearshape.fill", colors: gray)
-                  }
+                  .frame(width: m.small, height: m.small + 20)
               }
 
               var searchPill: some View {
                   Button { withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) { nav.spotlight = true } } label: {
                       HStack(spacing: 5) {
                           Image(systemName: "magnifyingglass").font(.system(size: 13, weight: .semibold))
-                          Text("Search").font(.system(size: 14, weight: .semibold))
+                          Text("Search").font(.system(size: 15, weight: .medium))
                       }
                       .foregroundStyle(.white)
-                      .padding(.horizontal, 14)
+                      .padding(.horizontal, 16)
                       .padding(.vertical, 8)
                       .glass(Capsule())
                   }
                   .buttonStyle(PressableStyle())
               }
 
-              var dock: some View {
+              func dock(_ m: HomeMetrics) -> some View {
                   HStack(spacing: 0) {
-                      HomeIcon(app: .phone, title: "Phone", symbol: "phone.fill", colors: green, badge: unheard, label: false)
+                      HomeIcon(app: .phone, title: "Phone", symbol: "phone.fill", colors: green, badge: unheard, label: false, size: m.icon)
                           .frame(maxWidth: .infinity)
-                      HomeIcon(app: .messages, title: "EyeMessage", symbol: "message.fill", colors: green, badge: unread, label: false)
+                      HomeIcon(app: .messages, title: "EyeMessage", symbol: "message.fill", colors: green, badge: unread, label: false, size: m.icon)
                           .frame(maxWidth: .infinity)
-                      HomeIcon(app: .notes, title: "Notes", symbol: "list.bullet.rectangle.portrait.fill", colors: yellow, fg: Color(hex: 0x6B5B1E), label: false)
+                      HomeIcon(app: .notes, title: "Notes", symbol: "list.bullet.rectangle.portrait.fill", colors: yellow, fg: Color(hex: 0x6B5B1E), label: false, size: m.icon)
                           .frame(maxWidth: .infinity)
-                      HomeIcon(app: .clock, title: "Clock", symbol: "clock.fill", colors: dark, label: false)
+                      HomeIcon(app: .settings, title: "Settings", symbol: "gearshape.fill", colors: gray, label: false, size: m.icon)
                           .frame(maxWidth: .infinity)
                   }
                   .padding(.vertical, 16)
-                  .padding(.horizontal, 4)
-                  .glass(RoundedRectangle(cornerRadius: 40, style: .continuous))
-                  .padding(.horizontal, 10)
+                  .padding(.horizontal, 6)
+                  .glass(RoundedRectangle(cornerRadius: 42, style: .continuous))
+                  .padding(.horizontal, 12)
               }
 
               var body: some View {
-                  ZStack {
-                      Wallpaper()
-                      VStack(spacing: 0) {
-                          widgets.padding(.horizontal, 26).padding(.top, 70)
-                          grid.padding(.horizontal, 18).padding(.top, 26)
-                          Spacer()
-                          searchPill.padding(.bottom, 14)
-                          dock.padding(.bottom, 14)
+                  GeometryReader { g in
+                      let m = HomeMetrics(width: g.size.width)
+                      ZStack {
+                          Wallpaper()
+                          VStack(spacing: 0) {
+                              Button { nav.open(.weather) } label: { WeatherWidget(m: m) }
+                                  .buttonStyle(PressableStyle())
+                                  .padding(.top, 76)
+                              HStack(alignment: .top, spacing: m.gutter) {
+                                  Button { nav.open(.calendar) } label: { CalendarWidget(m: m) }
+                                      .buttonStyle(PressableStyle())
+                                  iconBlock(m)
+                              }
+                              .padding(.top, 30)
+                              Spacer()
+                              searchPill.padding(.bottom, 16)
+                              dock(m).padding(.bottom, 14)
+                          }
+                          .frame(width: g.size.width)
                       }
                       .ignoresSafeArea(edges: .bottom)
                   }

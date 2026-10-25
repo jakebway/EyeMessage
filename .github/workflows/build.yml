@@ -1029,7 +1029,7 @@ jobs:
                   }
                   .padding(.horizontal, 12)
                   .padding(.top, 6)
-                  .padding(.bottom, 6)
+                  .padding(.bottom, 12)
                   .background(alignment: .top) {
                       EdgeFade(top: false)
                           .padding(.top, -22)
@@ -1090,20 +1090,59 @@ jobs:
                   }
               }
 
+              func back() {
+                  focused = false
+                  if !nav.messagesPath.isEmpty { nav.messagesPath.removeLast() } else { dismiss() }
+              }
+
+              // The header lives in the real navigation bar: always tappable, real glass, real scroll-edge blur.
+              @ToolbarContentBuilder
+              func bar(_ c: Conversation) -> some ToolbarContent {
+                  ToolbarItem(placement: .topBarLeading) {
+                      Button(action: back) {
+                          HStack(spacing: 3) {
+                              Image(systemName: "chevron.left").font(.system(size: 17, weight: .semibold))
+                              if unreadElsewhere > 0 {
+                                  Text("\(unreadElsewhere)").font(.system(size: 16, weight: .semibold))
+                              }
+                          }
+                      }
+                      .accessibilityLabel("Back")
+                  }
+                  ToolbarItem(placement: .principal) {
+                      Button { showContact = true } label: {
+                          VStack(spacing: 1) {
+                              Avatar(convo: c, size: 32)
+                              HStack(spacing: 2) {
+                                  Text(c.name).font(.system(size: 11, weight: .medium)).foregroundStyle(.primary)
+                                  Image(systemName: "chevron.right")
+                                      .font(.system(size: 7, weight: .bold))
+                                      .foregroundStyle(.secondary)
+                              }
+                          }
+                      }
+                      .buttonStyle(.plain)
+                  }
+                  ToolbarItem(placement: .topBarTrailing) {
+                      Button {} label: { Image(systemName: "video") }
+                  }
+              }
+
               var body: some View {
                   Group {
                       if let c = convo {
                           thread(c)
-                              .safeAreaInset(edge: .top, spacing: 0) { header(c) }
                               .safeAreaInset(edge: .bottom, spacing: 0) { inputBar }
                               .sheet(isPresented: $showContact) { ContactSheet(convo: c) }
+                              .toolbar { bar(c) }
                       } else {
                           Color(.systemBackground)
                       }
                   }
                   .background(Color(.systemBackground))
                   .navigationBarBackButtonHidden(true)
-                  .toolbar(.hidden, for: .navigationBar)
+                  .navigationBarTitleDisplayMode(.inline)
+                  .navigationTitle(convo?.name ?? "")
               }
           }
 
@@ -1972,7 +2011,7 @@ jobs:
                       .buttonStyle(PressableStyle())
                   }
                   .padding(.horizontal, 16)
-                  .padding(.bottom, 2)
+                  .padding(.bottom, 10)
               }
 
               var list: some View {
@@ -3468,25 +3507,29 @@ jobs:
               let action: () -> Void
               @State private var lift: CGFloat = 0
 
-              // Inside apps the bar sits a little higher than the real one, and its grab zone starts
-              // above the screen edge, so swiping it doesn't trigger the real iOS home gesture.
+              // iOS won't let an app take over the swipe from the very bottom edge, so inside apps the
+              // bar floats higher, clear of the system zone, and goes home on a swipe up OR a tap.
               var body: some View {
                   ZStack(alignment: .bottom) {
                       Color.clear
-                          .frame(width: 240, height: raised ? 30 : 36)
+                          .frame(width: 200, height: raised ? 24 : 36)
                           .contentShape(Rectangle())
-                          .padding(.bottom, raised ? 10 : 0)
                       Capsule()
                           .fill(light ? Color.white : Color.primary)
                           .frame(width: 136, height: 5)
-                          .padding(.bottom, raised ? 22 : 8)
+                          .padding(.bottom, raised ? 10 : 8)
                           .offset(y: lift)
                   }
+                  .padding(.bottom, raised ? 16 : 0)
+                  .onTapGesture {
+                      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                      action()
+                  }
                   .gesture(
-                      DragGesture(minimumDistance: 6)
-                          .onChanged { v in lift = max(-24, min(0, v.translation.height * 0.35)) }
+                      DragGesture(minimumDistance: 4)
+                          .onChanged { v in lift = max(-24, min(0, v.translation.height * 0.4)) }
                           .onEnded { v in
-                              if v.translation.height < -20 || v.predictedEndTranslation.height < -70 {
+                              if v.translation.height < -12 || v.predictedEndTranslation.height < -50 {
                                   UIImpactFeedbackGenerator(style: .light).impactOccurred()
                                   action()
                               }

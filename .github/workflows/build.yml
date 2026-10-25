@@ -36,21 +36,50 @@ jobs:
               ]
           }
 
+          // Each provider keeps its own key and model, so switching provider can never leave
+          // a Groq key pointed at Gemini (or a stale URL or model) behind.
           enum AIConfig {
               private static var d: UserDefaults { .standard }
+              static func trim(_ s: String?) -> String { (s ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
+
               static var enabled: Bool { d.object(forKey: "ai.enabled") as? Bool ?? false }
-              static var key: String {
-                  (d.string(forKey: "ai.key") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+              static var provider: String { d.string(forKey: "ai.provider") ?? "gemini" }
+              static func preset(_ p: String) -> AIPreset { AIPreset.all.first { $0.id == p } ?? AIPreset.all[0] }
+
+              static func keyFor(_ p: String) -> String { trim(d.string(forKey: "ai.key." + p)) }
+              static func setKey(_ k: String, for p: String) { d.set(trim(k), forKey: "ai.key." + p) }
+              static func modelFor(_ p: String) -> String {
+                  let v = trim(d.string(forKey: "ai.model." + p))
+                  return v.isEmpty ? preset(p).model : v
               }
+              static func setModel(_ m: String, for p: String) { d.set(trim(m), forKey: "ai.model." + p) }
+
+              static var key: String { keyFor(provider) }
+              static var model: String { modelFor(provider) }
               static var base: String {
-                  let v = (d.string(forKey: "ai.base") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                  return v.isEmpty ? AIPreset.all[0].base : v
+                  provider == "custom" ? trim(d.string(forKey: "ai.base")) : preset(provider).base
               }
-              static var model: String {
-                  let v = (d.string(forKey: "ai.model") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                  return v.isEmpty ? AIPreset.all[0].model : v
+              static var ready: Bool { enabled && !key.isEmpty && !base.isEmpty && !model.isEmpty }
+
+              // Recognise a pasted key so it lands with the right provider.
+              static func detect(_ key: String) -> String? {
+                  let k = trim(key)
+                  if k.hasPrefix("gsk_") { return "groq" }
+                  if k.hasPrefix("AIza") { return "gemini" }
+                  if k.hasPrefix("sk-or-") { return "openrouter" }
+                  return nil
               }
-              static var ready: Bool { enabled && !key.isEmpty }
+
+              // Moves a key saved by an older version into its provider's slot.
+              static func migrate() {
+                  let legacy = trim(d.string(forKey: "ai.key"))
+                  guard !legacy.isEmpty else { return }
+                  let p = detect(legacy) ?? provider
+                  if keyFor(p).isEmpty { setKey(legacy, for: p) }
+                  if detect(legacy) != nil { d.set(p, forKey: "ai.provider") }
+                  d.removeObject(forKey: "ai.key")
+                  d.removeObject(forKey: "ai.model")
+              }
           }
 
           struct LLMRequest {
@@ -64,125 +93,238 @@ jobs:
               static var lastSuccess: Date? = nil
               static var retryAfter: Double = 0
 
-              static func endpoint() -> URL? {
+              static let session: URLSession = {
+                  let c = URLSessionConfiguration.default
+                  c.timeoutIntervalForRequest = 30
+                  c.waitsForConnectivity = false
+                  return URLSession(configuration: c)
+              }()
+
+              static var isGemini: Bool { AIConfig.provider == "gemini" }
+
+              // MARK: one request
+
+              static func complete(_ req: LLMRequest, maxTokens: Int = 4096, model: String? = nil) async -> String? {
+                  let m = model ?? AIConfig.model
+                  return isGemini ? await gemini(req, maxTokens: maxTokens, model: m) : await openAI(req, maxTokens: maxTokens, model: m)
+              }
+
+              static func friendly(_ code: Int, _ body: Data) -> String {
+                  let raw = String(data: body, encoding: .utf8) ?? ""
+                  var detail = ""
+                  if let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                      if let err = obj["error"] as? [String: Any], let msg = err["message"] as? String { detail = msg }
+                      else if let msg = obj["message"] as? String { detail = msg }
+                  }
+                  if detail.isEmpty { detail = String(raw.prefix(140)) }
+                  switch code {
+                  case 400 where detail.lowercased().contains("api key"): return "That key was rejected. Paste it again, with nothing extra."
+                  case 401, 403: return "That key was rejected (\(code)). Check you copied all of it, for the right provider."
+                  case 404: return "Model not found: " + String(detail.prefix(120))
+                  case 429: return "Rate limited. The free tier needs a short breather; try again in a minute."
+                  case 500...599: return "The provider is having trouble (\(code)). Try again shortly."
+                  default: return "Error \(code): " + String(detail.prefix(160))
+                  }
+              }
+
+              static func send(_ r: URLRequest) async -> (Data, Int)? {
+                  do {
+                      let (d, resp) = try await session.data(for: r)
+                      let http = resp as? HTTPURLResponse
+                      let code = http?.statusCode ?? 0
+                      lastStatus = code
+                      retryAfter = Double(http?.value(forHTTPHeaderField: "retry-after") ?? "") ?? 3
+                      if !(200..<300).contains(code) {
+                          lastError = friendly(code, d)
+                          return nil
+                      }
+                      return (d, code)
+                  } catch {
+                      lastStatus = 0
+                      let ns = error as NSError
+                      lastError = ns.code == NSURLErrorNotConnectedToInternet ? "No internet connection." :
+                          (ns.code == NSURLErrorTimedOut ? "The reply took too long. Try again." : error.localizedDescription)
+                      return nil
+                  }
+              }
+
+              static func finish(_ text: String?) -> String? {
+                  let out = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                  if out.isEmpty {
+                      if lastError.isEmpty { lastError = "The model sent an empty reply. Try again, or pick another model." }
+                      return nil
+                  }
+                  lastError = ""
+                  lastSuccess = Date()
+                  return out
+              }
+
+              // Google's own Gemini API (more reliable than its OpenAI-compatible bridge).
+              static func gemini(_ req: LLMRequest, maxTokens: Int, model: String) async -> String? {
+                  let name = model.hasPrefix("models/") ? String(model.dropFirst(7)) : model
+                  var comps = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(name):generateContent")
+                  comps?.queryItems = [URLQueryItem(name: "key", value: AIConfig.key)]
+                  guard let url = comps?.url else { lastError = "Bad model name."; return nil }
+
+                  var contents: [[String: Any]] = []
+                  for m in req.messages {
+                      let role = m["role"] == "assistant" ? "model" : "user"
+                      let text = m["content"] ?? ""
+                      if var last = contents.last, (last["role"] as? String) == role,
+                         var parts = last["parts"] as? [[String: String]] {
+                          parts.append(["text": text])
+                          last["parts"] = parts
+                          contents[contents.count - 1] = last
+                      } else {
+                          contents.append(["role": role, "parts": [["text": text]]])
+                      }
+                  }
+                  let safety = ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_DANGEROUS_CONTENT", "HARM_CATEGORY_SEXUALLY_EXPLICIT"]
+                      .map { ["category": $0, "threshold": "BLOCK_ONLY_HIGH"] }
+                  let body: [String: Any] = [
+                      "systemInstruction": ["parts": [["text": req.system]]],
+                      "contents": contents,
+                      "generationConfig": ["temperature": 0.85, "maxOutputTokens": maxTokens],
+                      "safetySettings": safety
+                  ]
+                  guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+                  var r = URLRequest(url: url)
+                  r.httpMethod = "POST"
+                  r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  r.httpBody = data
+                  guard let res = await send(r) else { return nil }
+                  let d = res.0
+                  guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+                      lastError = "Couldn't read Gemini's reply."
+                      return nil
+                  }
+                  let cands = obj["candidates"] as? [[String: Any]] ?? []
+                  guard let first = cands.first else {
+                      let fb = (obj["promptFeedback"] as? [String: Any])?["blockReason"] as? String
+                      lastError = fb != nil ? "Gemini blocked that reply (\(fb!)). Try rephrasing." : "Gemini sent no reply."
+                      return nil
+                  }
+                  let parts = ((first["content"] as? [String: Any])?["parts"] as? [[String: Any]]) ?? []
+                  let text = parts.filter { ($0["thought"] as? Bool) != true }.compactMap { $0["text"] as? String }.joined()
+                  if text.isEmpty, let reason = first["finishReason"] as? String {
+                      lastError = reason == "MAX_TOKENS" ? "The reply ran out of room. Try again." : "Gemini stopped early (\(reason))."
+                  }
+                  return finish(text)
+              }
+
+              // Groq, OpenRouter and custom endpoints (OpenAI chat-completions format).
+              static func openAI(_ req: LLMRequest, maxTokens: Int, model: String) async -> String? {
                   var b = AIConfig.base
                   while b.hasSuffix("/") { b.removeLast() }
                   if !b.hasSuffix("/chat/completions") { b += "/chat/completions" }
-                  return URL(string: b)
-              }
-
-              static func body(_ req: LLMRequest, maxTokens: Int, model: String) -> [String: Any] {
+                  guard let url = URL(string: b) else { lastError = "That base URL doesn't look right."; return nil }
                   var msgs: [[String: String]] = [["role": "system", "content": req.system]]
                   msgs += req.messages
                   var payload: [String: Any] = [
                       "model": model,
                       "messages": msgs,
-                      "max_tokens": maxTokens,
-                      "temperature": 0.8
+                      "max_tokens": min(maxTokens, 2048),
+                      "temperature": 0.85
                   ]
-                  let isGroq = AIConfig.base.contains("groq.com")
-                  let m = model.lowercased()
-                  if isGroq && m.contains("gpt-oss") {
-                      payload["reasoning_effort"] = "low"
-                  } else if isGroq && (m.contains("qwen") || m.contains("deepseek")) {
-                      payload["reasoning_format"] = "hidden"
-                  } else if AIConfig.base.contains("generativelanguage.googleapis.com") {
-                      // Keep Gemini's hidden thinking short so the reply arrives fast and isn't cut off.
-                      payload["reasoning_effort"] = m.contains("2.5") ? "none" : "low"
+                  let low = model.lowercased()
+                  if AIConfig.base.contains("groq.com") {
+                      if low.contains("gpt-oss") { payload["reasoning_effort"] = "low" }
+                      else if low.contains("qwen") || low.contains("deepseek") { payload["reasoning_format"] = "hidden" }
                   }
-                  return payload
-              }
-
-              // Returns nil on failure so the caller can fall back to the on-device engine.
-              static func complete(_ req: LLMRequest, maxTokens: Int = 2048, model: String? = nil) async -> String? {
-                  guard let url = endpoint() else { lastError = "That base URL doesn't look right."; return nil }
-                  let m = model ?? AIConfig.model
-                  guard let data = try? JSONSerialization.data(withJSONObject: body(req, maxTokens: maxTokens, model: m)) else { return nil }
-                  var r = URLRequest(url: url, timeoutInterval: 25)
+                  guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
+                  var r = URLRequest(url: url)
                   r.httpMethod = "POST"
                   r.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   r.setValue("Bearer " + AIConfig.key, forHTTPHeaderField: "Authorization")
-                  r.setValue("The Whisper", forHTTPHeaderField: "X-Title")
+                  r.setValue("EyeMessage", forHTTPHeaderField: "X-Title")
                   r.httpBody = data
-                  do {
-                      let (d, resp) = try await URLSession.shared.data(for: r)
-                      let http = resp as? HTTPURLResponse
-                      let code = http?.statusCode ?? 0
-                      lastStatus = code
-                      guard (200..<300).contains(code) else {
-                          retryAfter = Double(http?.value(forHTTPHeaderField: "retry-after") ?? "") ?? 3
-                          let snippet = String((String(data: d, encoding: .utf8) ?? "").prefix(160))
-                          lastError = "HTTP \(code). " + snippet
-                          return nil
-                      }
-                      guard let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any],
-                            let choices = obj["choices"] as? [[String: Any]],
-                            let msg = choices.first?["message"] as? [String: Any],
-                            let content = msg["content"] as? String else {
-                          lastError = "The provider's reply wasn't in the expected format."
-                          return nil
-                      }
-                      let out = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                      if out.isEmpty {
-                          lastError = "The model returned an empty reply (it may have spent its budget thinking)."
-                          return nil
-                      }
-                      lastError = ""
-                      lastSuccess = Date()
-                      return out
-                  } catch {
-                      lastStatus = 0
-                      lastError = error.localizedDescription
+                  guard let res = await send(r) else { return nil }
+                  let d = res.0
+                  guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                        let choices = obj["choices"] as? [[String: Any]],
+                        let msg = choices.first?["message"] as? [String: Any] else {
+                      lastError = "The provider's reply wasn't in the expected format."
                       return nil
                   }
+                  return finish(msg["content"] as? String)
               }
 
-              // Lists the chat models this key can use (GET /models), so nobody has to guess model names.
+              // MARK: models
+
               static func listModels() async -> [String] {
-                  var b = AIConfig.base
-                  while b.hasSuffix("/") { b.removeLast() }
-                  guard let url = URL(string: b + "/models") else { return [] }
-                  var r = URLRequest(url: url, timeoutInterval: 15)
-                  r.setValue("Bearer " + AIConfig.key, forHTTPHeaderField: "Authorization")
-                  guard let res = try? await URLSession.shared.data(for: r),
-                        let code = (res.1 as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
-                        let obj = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any],
-                        let data = obj["data"] as? [[String: Any]] else {
-                      lastError = "Couldn't load the model list."
-                      return []
+                  var ids: [String] = []
+                  if isGemini {
+                      var comps = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models")
+                      comps?.queryItems = [URLQueryItem(name: "key", value: AIConfig.key), URLQueryItem(name: "pageSize", value: "200")]
+                      guard let url = comps?.url, let res = await send(URLRequest(url: url)),
+                            let obj = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any],
+                            let list = obj["models"] as? [[String: Any]] else { return [] }
+                      ids = list.filter { (($0["supportedGenerationMethods"] as? [String]) ?? []).contains("generateContent") }
+                          .compactMap { $0["name"] as? String }
+                          .map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
+                  } else {
+                      var b = AIConfig.base
+                      while b.hasSuffix("/") { b.removeLast() }
+                      guard let url = URL(string: b + "/models") else { return [] }
+                      var r = URLRequest(url: url)
+                      r.setValue("Bearer " + AIConfig.key, forHTTPHeaderField: "Authorization")
+                      guard let res = await send(r),
+                            let obj = try? JSONSerialization.jsonObject(with: res.0) as? [String: Any],
+                            let data = obj["data"] as? [[String: Any]] else { return [] }
+                      ids = data.compactMap { $0["id"] as? String }
                   }
-                  let skip = ["whisper", "guard", "tts", "embed", "orpheus", "imagen", "veo", "aqa", "image", "audio", "safeguard", "learnlm", "live", "native"]
-                  let ids = data.compactMap { $0["id"] as? String }
-                      .map { $0.hasPrefix("models/") ? String($0.dropFirst(7)) : $0 }
-                      .filter { id in !skip.contains { id.lowercased().contains($0) } }
-                  return Array(Set(ids)).sorted()
+                  let skip = ["whisper", "guard", "tts", "embed", "orpheus", "imagen", "veo", "aqa", "image", "audio",
+                              "safeguard", "learnlm", "live", "native", "vision", "robotics", "computer-use"]
+                  return Array(Set(ids.filter { id in !skip.contains { id.lowercased().contains($0) } })).sorted()
               }
 
-              // Groq gives every model its own free quota, so a rate-limited reply can try a sibling model.
+              // Picks the best chat model this key can actually use.
+              static func bestModel(from ids: [String]) -> String? {
+                  let prefs: [String] = isGemini
+                      ? ["gemini-flash-latest", "gemini-3", "flash"]
+                      : ["gpt-oss-120b", "kimi", "llama-3.3-70b", "qwen", "gpt-oss-20b", "llama"]
+                  for p in prefs {
+                      let hits = ids.filter { $0.lowercased().contains(p) && !$0.contains("lite") && !$0.contains("preview-tts") }
+                      if let best = hits.sorted().last { return best }
+                  }
+                  return ids.first
+              }
+
+              // MARK: retries
+
               static let groqFallbacks = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
               static let geminiFallbacks = ["gemini-flash-latest", "gemini-flash-lite-latest"]
 
-              // Retries: waits out a short rate limit or a blip, then falls back to another free model.
               static func completeWithRetry(_ req: LLMRequest) async -> String? {
                   if let out = await complete(req) { return out }
-                  if lastStatus == 401 || lastStatus == 403 || lastStatus == 400 { return nil }
-                  if lastStatus != 404 {
-                      let wait = lastStatus == 429 ? min(max(retryAfter, 1), 6) : 1.2
-                      if lastStatus != 429 || retryAfter <= 6 {
-                          try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                  let firstError = lastError
+
+                  // Wrong or retired model: find one this key can use, remember it, and try again.
+                  if lastStatus == 404 || (lastStatus == 400 && lastError.lowercased().contains("model")) {
+                      let ids = await listModels()
+                      if let m = bestModel(from: ids), m != AIConfig.model {
+                          AIConfig.setModel(m, for: AIConfig.provider)
                           if let out = await complete(req) { return out }
                       }
+                      lastError = firstError
+                      return nil
                   }
-                  let fallbacks = AIConfig.base.contains("groq.com") ? groqFallbacks :
-                      (AIConfig.base.contains("googleapis.com") ? geminiFallbacks : [])
-                  if !fallbacks.isEmpty && (lastStatus == 429 || lastStatus == 404) {
-                      let firstError = lastError
+                  if lastStatus == 401 || lastStatus == 403 || lastStatus == 400 { return nil }
+
+                  // Blip or short rate limit: wait and retry once.
+                  if lastStatus != 429 || retryAfter <= 6 {
+                      let wait = lastStatus == 429 ? min(max(retryAfter, 1), 6) : 1.0
+                      try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                      if let out = await complete(req) { return out }
+                  }
+                  // Each free model has its own quota, so a sibling model often still works.
+                  if lastStatus == 429 {
+                      let fallbacks = isGemini ? geminiFallbacks : (AIConfig.base.contains("groq.com") ? groqFallbacks : [])
                       for m in fallbacks where m != AIConfig.model {
                           if let out = await complete(req, model: m) { return out }
-                          if lastStatus == 401 { break }
                       }
-                      lastError = firstError
                   }
+                  if lastError.isEmpty { lastError = firstError }
                   return nil
               }
           }
@@ -2429,6 +2571,7 @@ jobs:
               }
 
               init() {
+                  AIConfig.migrate()
                   if let data = UserDefaults.standard.data(forKey: saveKey),
                      let snap = try? JSONDecoder().decode(Snapshot.self, from: data) {
                       conversations = snap.conversations
@@ -3143,12 +3286,12 @@ jobs:
 
               @AppStorage("ai.enabled") private var enabled = false
               @AppStorage("ai.provider") private var provider = "gemini"
-              @AppStorage("ai.base") private var base = "https://generativelanguage.googleapis.com/v1beta/openai"
-              @AppStorage("ai.model") private var model = "gemini-flash-latest"
-              @AppStorage("ai.key") private var key = ""
+              @AppStorage("ai.base") private var customBase = ""
               @AppStorage("sounds") private var sounds = true
               @AppStorage("fastReplies") private var fastReplies = false
 
+              @State private var keyText = ""
+              @State private var modelText = ""
               @State private var testing = false
               @State private var testResult = ""
               @State private var testOK = false
@@ -3157,26 +3300,60 @@ jobs:
               @State private var loadingModels = false
               @State private var showModels = false
 
-              func applyPreset(_ id: String) {
-                  guard let p = AIPreset.all.first(where: { $0.id == id }), id != "custom" else { return }
-                  base = p.base
-                  model = p.model
+              static let keyPages: [String: String] = [
+                  "gemini": "https://aistudio.google.com/apikey",
+                  "groq": "https://console.groq.com/keys",
+                  "openrouter": "https://openrouter.ai/settings/keys"
+              ]
+
+              func load() {
+                  keyText = AIConfig.keyFor(provider)
+                  modelText = AIConfig.modelFor(provider)
+              }
+
+              func saveKey(_ k: String) {
+                  let clean = k.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if let detected = AIConfig.detect(clean), detected != provider {
+                      // A pasted key decides its own provider.
+                      AIConfig.setKey(clean, for: detected)
+                      provider = detected
+                      modelText = AIConfig.modelFor(detected)
+                      testResult = "Recognised a " + AIConfig.preset(detected).label + " key and switched to it."
+                      testOK = true
+                  } else {
+                      AIConfig.setKey(clean, for: provider)
+                  }
               }
 
               func runTest() {
                   testing = true
                   testResult = ""
                   Task { @MainActor in
-                      let req = LLMRequest(system: "You are Pip, a sarcastic fox spirit. Reply with one short lowercase text message.",
+                      let req = LLMRequest(system: "You are Pip, a sarcastic fox spirit who types in lowercase. Reply with one short text message.",
                                            messages: [["role": "user", "content": "hello? is anyone there?"]])
-                      let out = await LLM.complete(req, maxTokens: 400)
+                      let out = await LLM.completeWithRetry(req)
                       testing = false
-                      if let out = out {
+                      if let out = out, let first = Director.parse(out).parts.first {
                           testOK = true
-                          testResult = "Connected. Pip says: " + String(Director.parse(out).parts.first?.prefix(120) ?? "")
+                          testResult = "Working. Pip says: " + String(first.prefix(140))
+                          if !enabled { enabled = true }
                       } else {
                           testOK = false
-                          testResult = LLM.lastError.isEmpty ? "No reply." : LLM.lastError
+                          testResult = LLM.lastError.isEmpty ? "No reply. Check the key and model." : LLM.lastError
+                      }
+                  }
+              }
+
+              func loadModels() {
+                  loadingModels = true
+                  Task { @MainActor in
+                      models = await LLM.listModels()
+                      loadingModels = false
+                      if models.isEmpty {
+                          testOK = false
+                          testResult = LLM.lastError.isEmpty ? "Couldn't load models. Check the key." : LLM.lastError
+                      } else {
+                          showModels = true
                       }
                   }
               }
@@ -3189,60 +3366,94 @@ jobs:
                   }
               }
 
+              var hasKey: Bool { !keyText.trimmingCharacters(in: .whitespaces).isEmpty }
+
+              var statusLine: some View {
+                  HStack(spacing: 8) {
+                      Circle()
+                          .fill(!enabled ? Color.gray : (hasKey ? (store.aiNote.isEmpty ? Color.green : Color.orange) : Color.red))
+                          .frame(width: 9, height: 9)
+                      Text(!enabled ? "Off: characters use the offline engine" :
+                              (!hasKey ? "Needs an API key" :
+                                  (store.aiNote.isEmpty ? "On: " + AIConfig.preset(provider).label + " · " + modelText : "On, but the last reply failed")))
+                          .font(.system(size: 15))
+                          .foregroundStyle(.secondary)
+                  }
+              }
+
               var aiSection: some View {
                   Section {
                       Toggle("Live AI characters", isOn: $enabled)
+                      statusLine
                       Picker("Provider", selection: $provider) {
                           ForEach(AIPreset.all) { p in Text(p.label).tag(p.id) }
                       }
-                      .onChange(of: provider) { p in applyPreset(p) }
-                      SecureField("API key", text: $key)
-                          .textInputAutocapitalization(.never)
-                          .autocorrectionDisabled()
-                      TextField("Base URL", text: $base)
-                          .textInputAutocapitalization(.never)
-                          .autocorrectionDisabled()
-                          .keyboardType(.URL)
-                      TextField("Model", text: $model)
-                          .textInputAutocapitalization(.never)
-                          .autocorrectionDisabled()
-                      Button {
-                          loadingModels = true
-                          Task { @MainActor in
-                              models = await LLM.listModels()
-                              loadingModels = false
-                              if models.isEmpty {
-                                  testOK = false
-                                  testResult = LLM.lastError
-                              } else {
-                                  showModels = true
+                      .pickerStyle(.menu)
+                      .onChange(of: provider) { _ in load() }
+                      HStack {
+                          SecureField("Paste API key", text: $keyText)
+                              .textInputAutocapitalization(.never)
+                              .autocorrectionDisabled()
+                              .onChange(of: keyText) { k in saveKey(k) }
+                          if hasKey {
+                              Button { keyText = "" } label: {
+                                  Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                               }
+                              .buttonStyle(.plain)
                           }
-                      } label: {
+                      }
+                      if let page = SettingsApp.keyPages[provider], let url = URL(string: page) {
+                          Link(destination: url) {
+                              Label("Get a free " + AIConfig.preset(provider).label.components(separatedBy: " (").first! + " key", systemImage: "key.fill")
+                          }
+                      }
+                      if provider == "custom" {
+                          TextField("Base URL (OpenAI-compatible)", text: $customBase)
+                              .textInputAutocapitalization(.never)
+                              .autocorrectionDisabled()
+                              .keyboardType(.URL)
+                      }
+                      HStack {
+                          Text("Model")
+                          TextField(AIConfig.preset(provider).model, text: $modelText)
+                              .multilineTextAlignment(.trailing)
+                              .textInputAutocapitalization(.never)
+                              .autocorrectionDisabled()
+                              .foregroundStyle(.secondary)
+                              .onChange(of: modelText) { m in AIConfig.setModel(m, for: provider) }
+                      }
+                      Button(action: loadModels) {
                           HStack {
-                              Text("Choose model from my account")
+                              Text("Choose from my models")
                               if loadingModels { Spacer(); ProgressView() }
                           }
                       }
-                      .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty || loadingModels)
-                      Button { runTest() } label: {
+                      .disabled(!hasKey || loadingModels)
+                      Button("Reset model to recommended") {
+                          modelText = AIConfig.preset(provider).model
+                      }
+                      .disabled(modelText == AIConfig.preset(provider).model)
+                      Button(action: runTest) {
                           HStack {
-                              Text("Test connection")
+                              Text("Test connection").fontWeight(.semibold)
                               if testing { Spacer(); ProgressView() }
                           }
                       }
-                      .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty || testing)
+                      .disabled(!hasKey || testing)
                       if !testResult.isEmpty {
                           Text(testResult).font(.footnote).foregroundStyle(testOK ? Color.green : Color.red)
+                              .textSelection(.enabled)
                       }
                       if !store.aiNote.isEmpty {
                           Text("Last failed reply: " + store.aiNote).font(.footnote).foregroundStyle(.orange)
+                              .textSelection(.enabled)
                       }
                   } header: {
                       Text("Characters")
                   } footer: {
-                      Text("With Live AI on, every contact is a full AI character with their own personality and memory, and the story moves forward through your conversations. Best: a free Google Gemini key from aistudio.google.com (Get API key), model gemini-flash-latest. Groq (console.groq.com) also works. Use Choose model to pick from what your key can use. Your key stays on this phone. If a reply fails you'll see Not Delivered: tap it to try again. With Live AI off, a simpler built-in engine plays the characters offline.")
+                      Text("Paste a key and tap Test connection; a working test turns Live AI on. Recommended: a free Google Gemini key (model gemini-flash-latest). Each provider remembers its own key, and a pasted key switches to the right provider by itself. Keys stay on this phone. With Live AI off, a simpler offline engine plays the characters.")
                   }
+                  .onAppear(perform: load)
               }
 
               var storySection: some View {
@@ -3306,13 +3517,13 @@ jobs:
                           NavigationStack {
                               List(models, id: \.self) { m in
                                   Button {
-                                      model = m
+                                      modelText = m
                                       showModels = false
                                   } label: {
                                       HStack {
                                           Text(m).foregroundStyle(.primary)
                                           Spacer()
-                                          if m == model { Image(systemName: "checkmark").foregroundStyle(imBlue) }
+                                          if m == modelText { Image(systemName: "checkmark").foregroundStyle(imBlue) }
                                       }
                                   }
                               }
@@ -3505,37 +3716,38 @@ jobs:
               let light: Bool
               let raised: Bool
               let action: () -> Void
-              @State private var lift: CGFloat = 0
+              @State private var pressed = false
 
-              // iOS won't let an app take over the swipe from the very bottom edge, so inside apps the
-              // bar floats higher, clear of the system zone, and goes home on a swipe up OR a tap.
+              // Tap the bar to go home. It floats a little above the real one inside apps,
+              // so it never collides with the system's own swipe-up gesture.
               var body: some View {
-                  ZStack(alignment: .bottom) {
-                      Color.clear
-                          .frame(width: 200, height: raised ? 24 : 36)
-                          .contentShape(Rectangle())
-                      Capsule()
-                          .fill(light ? Color.white : Color.primary)
-                          .frame(width: 136, height: 5)
-                          .padding(.bottom, raised ? 10 : 8)
-                          .offset(y: lift)
-                  }
-                  .padding(.bottom, raised ? 16 : 0)
-                  .onTapGesture {
+                  Button {
                       UIImpactFeedbackGenerator(style: .light).impactOccurred()
                       action()
+                  } label: {
+                      ZStack(alignment: .bottom) {
+                          Color.clear
+                              .frame(width: 200, height: raised ? 26 : 36)
+                              .contentShape(Rectangle())
+                          Capsule()
+                              .fill(light ? Color.white : Color.primary)
+                              .frame(width: 136, height: 5)
+                              .padding(.bottom, raised ? 10 : 8)
+                      }
                   }
-                  .gesture(
-                      DragGesture(minimumDistance: 4)
-                          .onChanged { v in lift = max(-24, min(0, v.translation.height * 0.4)) }
-                          .onEnded { v in
-                              if v.translation.height < -12 || v.predictedEndTranslation.height < -50 {
-                                  UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                  action()
-                              }
-                              withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { lift = 0 }
-                          }
-                  )
+                  .buttonStyle(HomeBarStyle())
+                  .padding(.bottom, raised ? 16 : 0)
+                  .accessibilityLabel("Home")
+              }
+          }
+
+          struct HomeBarStyle: ButtonStyle {
+              func makeBody(configuration: Configuration) -> some View {
+                  configuration.label
+                      .scaleEffect(x: configuration.isPressed ? 1.12 : 1, y: 1)
+                      .offset(y: configuration.isPressed ? -3 : 0)
+                      .opacity(configuration.isPressed ? 0.7 : 1)
+                      .animation(.spring(response: 0.25, dampingFraction: 0.6), value: configuration.isPressed)
               }
           }
 

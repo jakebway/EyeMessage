@@ -13,9 +13,10 @@ jobs:
 
       - name: Write app source
         run: |
-          mkdir -p App
+          mkdir -p App scripts App/Assets.xcassets/AppIcon.appiconset
           cat > App/MessagesApp.swift <<'EOF'
           import SwiftUI
+          import UIKit
 
           @main
           struct MessagesApp: App {
@@ -23,31 +24,245 @@ jobs:
                   WindowGroup { ContentView() }
               }
           }
+
+          // Keeps the swipe-back gesture working with the custom chat header.
+          extension UINavigationController: UIGestureRecognizerDelegate {
+              override open func viewDidLoad() {
+                  super.viewDidLoad()
+                  interactivePopGestureRecognizer?.delegate = self
+              }
+
+              public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+                  viewControllers.count > 1
+              }
+          }
+          EOF
+          cat > App/Engine.swift <<'EOF'
+          import Foundation
+
+          struct Ping {
+              let to: String
+              let text: String
+              let delay: Double
+              var sets: [String] = []
+          }
+
+          struct Trigger {
+              let id: String
+              let when: [String]
+              let pings: [Ping]
+          }
+
+          struct Intent {
+              let id: String
+              var keys: [String]
+              var weight: Double = 1
+              var needs: [String] = []
+              var blocks: [String] = []
+              var all: [String] = []
+              var requiresLast: String? = nil
+              var replies: [String]
+              var sets: [String] = []
+          }
+
+          func intent(_ id: String, _ keys: [String], _ replies: [String], w: Double = 1,
+                      needs: [String] = [], blocks: [String] = [], all: [String] = [],
+                      last: String? = nil, sets: [String] = []) -> Intent {
+              Intent(id: id, keys: keys, weight: w, needs: needs, blocks: blocks, all: all,
+                     requiresLast: last, replies: replies, sets: sets)
+          }
+
+          struct Persona {
+              let key: String
+              let name: String
+              let emoji: String
+              let c1: UInt32
+              let c2: UInt32
+              let intents: [Intent]
+              let fallbacks: [String]
+              let hint: (Set<String>) -> String?
+              let endings: [String: [String]]
+          }
+
+          struct EngineResult {
+              var parts: [String]
+              var sets: [String]
+              var intentID: String?
+              var matched: Bool
+              var detectedName: String?
+          }
+
+          // A small on-device dialogue model: normalises the text, scores every intent with
+          // phrase / keyword / prefix / fuzzy (edit distance) matching, applies story-flag
+          // gating and conversational memory, then picks a reply. No network needed.
+          enum Engine {
+              static let endFlags = ["end_return", "end_keep", "end_break", "end_dark"]
+
+              static let notNames: Set<String> = Set([
+                  "a", "an", "the", "not", "just", "here", "so", "very", "sorry", "really", "looking",
+                  "trying", "new", "your", "sure", "back", "fine", "good", "okay", "ok", "in", "at", "on",
+                  "from", "only", "still", "also", "going", "gonna", "wondering", "curious", "afraid",
+                  "scared", "worried", "confused", "lost", "ready", "happy", "glad", "kind", "who", "what",
+                  "how", "he", "she", "it", "ilsabet", "vesper", "pip", "corvin", "maud", "delphine",
+                  "nobody", "someone", "somebody", "human", "real", "serious", "honest", "alone", "tired",
+                  "stuck", "no", "yes", "bored", "nervous", "safe", "pretty", "quite", "now", "then"
+              ])
+
+              static func normalize(_ s: String) -> String {
+                  let lowered = s.lowercased().replacingOccurrences(of: "&", with: " and ")
+                  var out = ""
+                  for ch in lowered {
+                      if ch == "'" || ch == "\u{2019}" { continue }
+                      if ch.isLetter || ch.isNumber { out.append(ch) } else { out.append(" ") }
+                  }
+                  return out.split(separator: " ").joined(separator: " ")
+              }
+
+              static func lev(_ a: String, _ b: String) -> Int {
+                  let x = Array(a), y = Array(b)
+                  if x.isEmpty { return y.count }
+                  if y.isEmpty { return x.count }
+                  var prev = Array(0...y.count)
+                  for i in 1...x.count {
+                      var cur = [Int](repeating: 0, count: y.count + 1)
+                      cur[0] = i
+                      for j in 1...y.count {
+                          let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                          cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+                      }
+                      prev = cur
+                  }
+                  return prev[y.count]
+              }
+
+              static func detectName(_ text: String) -> String? {
+                  let words = text.split(whereSeparator: { !($0.isLetter || $0 == "'" || $0 == "\u{2019}") }).map(String.init)
+                  let low = words.map { $0.lowercased().replacingOccurrences(of: "'", with: "").replacingOccurrences(of: "\u{2019}", with: "") }
+                  func at(_ j: Int) -> String { j >= 0 && j < low.count ? low[j] : "" }
+                  func candidate(_ j: Int, needCap: Bool) -> String? {
+                      guard j < words.count else { return nil }
+                      let l = low[j]
+                      if notNames.contains(l) || l.count < 2 || l.count > 14 { return nil }
+                      if needCap && !(words[j].first?.isUppercase ?? false) { return nil }
+                      return words[j].prefix(1).uppercased() + words[j].dropFirst().lowercased()
+                  }
+                  for i in 0..<low.count {
+                      if at(i) == "my" && at(i + 1) == "name" && at(i + 2) == "is", let n = candidate(i + 3, needCap: false) { return n }
+                      if at(i) == "name" && at(i + 1) == "is", let n = candidate(i + 2, needCap: false) { return n }
+                      if at(i) == "call" && at(i + 1) == "me", let n = candidate(i + 2, needCap: false) { return n }
+                      if at(i) == "im", let n = candidate(i + 1, needCap: true) { return n }
+                      if at(i) == "i" && at(i + 1) == "am", let n = candidate(i + 2, needCap: true) { return n }
+                  }
+                  return nil
+              }
+
+              static func matchScore(_ key: String, _ tokens: [String], _ padded: String) -> Double {
+                  if key.contains(" ") { return padded.contains(" \(key) ") ? 2.5 : 0 }
+                  if tokens.contains(key) { return 1 }
+                  if key.count >= 4, tokens.contains(where: { $0.hasPrefix(key) && $0.count - key.count <= 3 }) { return 0.8 }
+                  if key.count >= 5, tokens.contains(where: { abs($0.count - key.count) <= 1 && lev($0, key) <= 1 }) { return 0.7 }
+                  return 0
+              }
+
+              static func makeParts(_ raw: String, name: String, hint: String?) -> [String] {
+                  var t = raw.replacingOccurrences(of: "{name}", with: name)
+                  t = t.replacingOccurrences(of: "{hint}", with: hint ?? "keep talking to me")
+                  return t.components(separatedBy: "||")
+                      .map { $0.trimmingCharacters(in: .whitespaces) }
+                      .filter { !$0.isEmpty }
+              }
+
+              static func respond(persona: Persona, text: String, counts: [String: Int], lastIntent: String?,
+                                  confused: Int, flags: Set<String>, finderName: String?) -> EngineResult {
+                  let detected = detectName(text)
+                  let name = detected ?? finderName ?? "stranger"
+                  var norm = normalize(text)
+                  var tokens = norm.split(separator: " ").map(String.init)
+                  if detected != nil {
+                      tokens.append("__name__")
+                      norm += " __name__"
+                  }
+                  let padded = " " + norm + " "
+                  let hint = persona.hint(flags)
+
+                  // After the story ends, everyone answers from their epilogue lines.
+                  if let end = endFlags.first(where: { flags.contains($0) }),
+                     let lines = persona.endings[end], !lines.isEmpty {
+                      let n = counts["epilogue"] ?? 0
+                      return EngineResult(parts: makeParts(lines[n % lines.count], name: name, hint: hint),
+                                          sets: [], intentID: "epilogue", matched: true, detectedName: detected)
+                  }
+
+                  var best: Intent? = nil
+                  var bestScore = 0.0
+                  for it in persona.intents {
+                      if !it.needs.allSatisfy({ flags.contains($0) }) { continue }
+                      if it.blocks.contains(where: { flags.contains($0) }) { continue }
+                      if let l = it.requiresLast, l != lastIntent { continue }
+                      if !it.all.allSatisfy({ padded.contains(" \($0) ") }) { continue }
+                      var s = 0.0
+                      for k in it.keys { s += matchScore(k, tokens, padded) }
+                      s *= it.weight
+                      if s > bestScore { bestScore = s; best = it }
+                  }
+
+                  if let it = best, bestScore >= 0.75 {
+                      let n = counts[it.id] ?? 0
+                      let idx: Int
+                      if n < it.replies.count { idx = n }
+                      else if it.replies.count > 1 { idx = Int.random(in: 1..<it.replies.count) }
+                      else { idx = 0 }
+                      return EngineResult(parts: makeParts(it.replies[idx], name: name, hint: hint),
+                                          sets: it.sets, intentID: it.id, matched: true, detectedName: detected)
+                  }
+
+                  var parts = [persona.fallbacks[confused % persona.fallbacks.count]]
+                  if confused >= 1, let h = hint { parts.append(h) }
+                  return EngineResult(parts: parts, sets: [], intentID: nil, matched: false, detectedName: detected)
+              }
+          }
           EOF
           cat > App/Models.swift <<'EOF'
           import SwiftUI
+          import UIKit
 
           let imBlue = Color(red: 0.04, green: 0.52, blue: 1.0)
+
+          extension Color {
+              init(hex: UInt32) {
+                  self.init(red: Double((hex >> 16) & 0xFF) / 255,
+                            green: Double((hex >> 8) & 0xFF) / 255,
+                            blue: Double(hex & 0xFF) / 255)
+              }
+          }
 
           func ago(_ minutes: Int) -> Date {
               Date().addingTimeInterval(-Double(minutes) * 60)
           }
 
-          struct ChatMessage: Identifiable {
-              let id = UUID()
+          struct ChatMessage: Identifiable, Codable {
+              var id = UUID()
               var text: String
               var isMe: Bool
               var date: Date
-              var sender: String? = nil
+              var fromFinder: Bool? = nil
           }
 
-          struct Conversation: Identifiable {
-              let id = UUID()
-              let created = Date()
+          struct Conversation: Identifiable, Codable {
+              var id = UUID()
+              var key: String
               var name: String
-              var isGroup = false
+              var emoji: String
+              var c1: UInt32
+              var c2: UInt32
+              var pinned = false
               var unread = false
+              var live = false
               var messages: [ChatMessage]
+              var counts: [String: Int] = [:]
+              var lastIntent: String? = nil
+              var confused = 0
+              var created = Date()
 
               var lastDate: Date { messages.last?.date ?? created }
               var preview: String { messages.last?.text ?? "" }
@@ -82,163 +297,914 @@ jobs:
               }
           }
 
+          struct Banner: Identifiable, Equatable {
+              let id = UUID()
+              let convoID: UUID
+              let title: String
+              let text: String
+          }
+
           final class ChatStore: ObservableObject {
-              @Published var conversations: [Conversation] = ChatStore.sample()
-              private var spareContacts = ["Alex Rivera", "Jordan Lee", "Taylor Brooks", "Sam Okafor"]
+              @Published var conversations: [Conversation] = [] { didSet { save() } }
+              @Published var flags: Set<String> = [] { didSet { save() } }
+              @Published var finderName: String? = nil { didSet { save() } }
+              @Published var typing: Set<UUID> = []
+              @Published var banner: Banner? = nil
+              var openChat: UUID? = nil
+              private var epoch = 0
+              private let saveKey = "story.v1"
+
+              struct Snapshot: Codable {
+                  var conversations: [Conversation]
+                  var flags: [String]
+                  var finderName: String?
+              }
+
+              init() {
+                  if let data = UserDefaults.standard.data(forKey: saveKey),
+                     let snap = try? JSONDecoder().decode(Snapshot.self, from: data) {
+                      conversations = snap.conversations
+                      flags = Set(snap.flags)
+                      finderName = snap.finderName
+                  } else {
+                      conversations = Story.initialConversations()
+                  }
+              }
+
+              private func save() {
+                  let snap = Snapshot(conversations: conversations, flags: Array(flags), finderName: finderName)
+                  if let d = try? JSONEncoder().encode(snap) {
+                      UserDefaults.standard.set(d, forKey: saveKey)
+                  }
+              }
 
               var sorted: [Conversation] {
                   conversations.sorted { $0.lastDate > $1.lastDate }
               }
 
-              func append(_ msg: ChatMessage, to id: UUID) {
-                  guard let i = conversations.firstIndex(where: { $0.id == id }) else { return }
-                  conversations[i].messages.append(msg)
-              }
+              func idx(_ id: UUID) -> Int? { conversations.firstIndex { $0.id == id } }
 
               func markRead(_ id: UUID) {
-                  guard let i = conversations.firstIndex(where: { $0.id == id }) else { return }
-                  if conversations[i].unread { conversations[i].unread = false }
+                  guard let i = idx(id), conversations[i].unread else { return }
+                  conversations[i].unread = false
               }
 
               func delete(_ id: UUID) {
                   conversations.removeAll { $0.id == id }
               }
 
-              func compose() {
-                  guard !spareContacts.isEmpty else { return }
-                  let name = spareContacts.removeFirst()
-                  conversations.append(Conversation(name: name, messages: []))
+              func reset() {
+                  epoch += 1
+                  UserDefaults.standard.removeObject(forKey: saveKey)
+                  typing = []
+                  banner = nil
+                  openChat = nil
+                  flags = []
+                  finderName = nil
+                  conversations = Story.initialConversations()
               }
 
-              private static func m(_ t: String, _ me: Bool, _ min: Int, _ sender: String? = nil) -> ChatMessage {
-                  ChatMessage(text: t, isMe: me, date: ago(min), sender: sender)
+              // MARK: timing
+
+              static func typeTime(_ s: String) -> Double {
+                  min(0.8 + Double(s.count) * 0.03, 3.0)
               }
 
-              static func sample() -> [Conversation] {
+              static func duration(_ parts: [String]) -> Double {
+                  0.9 + parts.reduce(0.0) { $0 + typeTime($1) + 0.4 }
+              }
+
+              // MARK: sending and replying
+
+              func send(_ text: String, to cid: UUID) {
+                  guard let i = idx(cid) else { return }
+                  conversations[i].messages.append(ChatMessage(text: text, isMe: true, date: Date(), fromFinder: true))
+                  conversations[i].unread = false
+                  guard conversations[i].live, let persona = Story.personas[conversations[i].key] else { return }
+                  let c = conversations[i]
+                  let res = Engine.respond(persona: persona, text: text, counts: c.counts, lastIntent: c.lastIntent,
+                                           confused: c.confused, flags: flags, finderName: finderName)
+                  if let n = res.detectedName { finderName = n }
+                  if res.intentID == "epilogue" {
+                      conversations[i].counts["epilogue", default: 0] += 1
+                  } else if res.matched, let iid = res.intentID {
+                      conversations[i].counts[iid, default: 0] += 1
+                      conversations[i].lastIntent = iid
+                      conversations[i].confused = 0
+                  } else {
+                      conversations[i].confused += 1
+                      conversations[i].lastIntent = nil
+                  }
+                  flags.formUnion(res.sets)
+                  var req: LLMRequest? = nil
+                  if AIConfig.ready {
+                      req = Director.request(persona: persona, convo: conversations[i], beat: res,
+                                             flags: flags, finderName: finderName)
+                  }
+                  deliver(res.parts, to: cid, ai: req)
+                  checkTriggers(offset: ChatStore.duration(res.parts) + (req == nil ? 0 : 3))
+              }
+
+              private func deliver(_ parts: [String], to cid: UUID, ai: LLMRequest? = nil) {
+                  let ep = epoch
+                  Task { @MainActor [weak self] in
+                      guard let self = self else { return }
+                      var parts = parts
+                      try? await Task.sleep(nanoseconds: 900_000_000)
+                      if let req = ai {
+                          self.typing.insert(cid)
+                          let text = await LLM.complete(req)
+                          self.typing.remove(cid)
+                          guard self.epoch == ep else { return }
+                          if let text = text {
+                              let p = Director.split(text)
+                              if !p.isEmpty { parts = p }
+                          }
+                      }
+                      for part in parts {
+                          guard self.epoch == ep, self.idx(cid) != nil else { return }
+                          self.typing.insert(cid)
+                          try? await Task.sleep(nanoseconds: UInt64(ChatStore.typeTime(part) * 1_000_000_000))
+                          guard self.epoch == ep else { return }
+                          self.typing.remove(cid)
+                          self.appendIncoming(part, to: cid)
+                          try? await Task.sleep(nanoseconds: 400_000_000)
+                      }
+                  }
+              }
+
+              private func appendIncoming(_ text: String, to cid: UUID) {
+                  guard let i = idx(cid) else { return }
+                  conversations[i].messages.append(ChatMessage(text: text, isMe: false, date: Date()))
+                  if openChat == cid { return }
+                  conversations[i].unread = true
+                  let b = Banner(convoID: cid, title: conversations[i].name, text: text)
+                  banner = b
+                  UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+                  Task { @MainActor [weak self] in
+                      try? await Task.sleep(nanoseconds: 4_000_000_000)
+                      if self?.banner == b { self?.banner = nil }
+                  }
+              }
+
+              private func ensureConversation(_ key: String) -> UUID? {
+                  if let c = conversations.first(where: { $0.key == key }) { return c.id }
+                  guard let p = Story.personas[key] else { return nil }
+                  let c = Conversation(key: p.key, name: p.name, emoji: p.emoji, c1: p.c1, c2: p.c2,
+                                       pinned: false, unread: false, live: true, messages: [])
+                  conversations.append(c)
+                  return c.id
+              }
+
+              private func schedule(_ ping: Ping, extraDelay: Double) {
+                  let ep = epoch
+                  Task { @MainActor [weak self] in
+                      guard let self = self else { return }
+                      try? await Task.sleep(nanoseconds: UInt64((ping.delay + extraDelay) * 1_000_000_000))
+                      guard self.epoch == ep, let cid = self.ensureConversation(ping.to) else { return }
+                      let name = self.finderName ?? "stranger"
+                      let raw = ping.text.replacingOccurrences(of: "{name}", with: name)
+                      for part in raw.components(separatedBy: "||") {
+                          guard self.epoch == ep, self.idx(cid) != nil else { return }
+                          self.typing.insert(cid)
+                          try? await Task.sleep(nanoseconds: UInt64(ChatStore.typeTime(part) * 1_000_000_000))
+                          guard self.epoch == ep else { return }
+                          self.typing.remove(cid)
+                          self.appendIncoming(part, to: cid)
+                          try? await Task.sleep(nanoseconds: 450_000_000)
+                      }
+                      if !ping.sets.isEmpty {
+                          self.flags.formUnion(ping.sets)
+                          self.checkTriggers(offset: 0)
+                      }
+                  }
+              }
+
+              func checkTriggers(offset: Double) {
+                  for t in Story.triggers {
+                      let fired = "fired_" + t.id
+                      if flags.contains(fired) { continue }
+                      if t.when.allSatisfy({ flags.contains($0) }) {
+                          flags.insert(fired)
+                          for p in t.pings { schedule(p, extraDelay: offset) }
+                      }
+                  }
+              }
+          }
+          EOF
+          cat > App/Story.swift <<'EOF'
+          import Foundation
+
+          enum Story {
+              static func m(_ t: String, _ me: Bool, _ min: Int) -> ChatMessage {
+                  ChatMessage(text: t, isMe: me, date: ago(min))
+              }
+
+              // MARK: opening state of the found phone
+
+              static func initialConversations() -> [Conversation] {
                   [
-                      Conversation(name: "Mom", messages: [
-                          m("Don't forget dinner on Sunday!", false, 1500),
-                          m("I won't, what time?", true, 1495),
-                          m("6pm. Dad is making his lasagna 🍝", false, 1490),
-                          m("Perfect, I'll bring dessert", true, 1488),
-                          m("You're the best ❤️", false, 1487),
-                          m("Also can you pick up the pie from Whole Foods?", false, 45),
-                          m("Sure, I'll grab it after work", true, 40),
-                          m("Thank you sweetheart. Drive safe!", false, 38)
+                      Conversation(key: "pip", name: "Pip", emoji: "🦊", c1: 0xFFB340, c2: 0xFF7A00,
+                                   pinned: true, unread: true, live: true, messages: [
+                          m("client at the door. says her cat has started speaking in her late mother's voice. do we take it?", false, 8600),
+                          m("We take it. Salt, a saucer of cream, and your better manners. 🌙", true, 8598),
+                          m("my manners are fine", false, 8597),
+                          m("Your manners bit the tax collector.", true, 8596),
+                          m("he had it coming", false, 8595),
+                          m("Shop opens at nine. Count the moths before you count the coin. 🌙", true, 7200),
+                          m("ilsabet?? the shop door just locked itself", false, 4390),
+                          m("from the OUTSIDE", false, 4389),
+                          m("you took your coat and not your phone. you never leave the whisper", false, 4385),
+                          m("corvin was here. he left a feather on your chair. didn't say anything, just looked at the stairs", false, 2900),
+                          m("ilsabet answer", false, 2899),
+                          m("ok it's been two nights", false, 1600),
+                          m("maud keeps asking about edric's shadow. delphine thinks the toaster is haunted. i said that's not our department", false, 1598),
+                          m("it's a little our department", false, 1597),
+                          m("if you're reading this i'm so mad at you", false, 300),
+                          m("also scared", false, 299),
+                          m("please", false, 298),
+                          m("still keeping the lamp lit", false, 40)
                       ]),
-                      Conversation(name: "Sarah Chen", unread: true, messages: [
-                          m("Did you see the game last night??", false, 300),
-                          m("YES. I can't believe that ending", true, 296),
-                          m("I literally screamed 😂", false, 295),
-                          m("My neighbors probably hate me now", true, 293),
-                          m("Are we still on for coffee Saturday?", false, 12),
-                          m("Also I found that book you were looking for", false, 11)
+                      Conversation(key: "corvin", name: "Corvin R.", emoji: "🐦‍⬛", c1: 0x6E6BF0, c2: 0x1C1C3A,
+                                   pinned: true, unread: true, live: true, messages: [
+                          m("Vesper. The year turns.", false, 20000),
+                          m("I know the date, Corvin. Send the bill in writing. 🌙", true, 19990),
+                          m("Dawn on the third night after the Hollow Moon. You will pay in person.", false, 19985),
+                          m("I will pay in coin.", true, 19980),
+                          m("I do not want coin.", false, 19978),
+                          m("You are not at your door. Interesting.", false, 4400),
+                          m("The hill will not hide you forever.", false, 1500),
+                          m("Dawn approaches, Vesper.", false, 35)
                       ]),
-                      Conversation(name: "Weekend Trip", isGroup: true, unread: true, messages: [
-                          m("Ok so cabin is booked for Fri–Sun 🏕", false, 2900, "Dev Patel"),
-                          m("Let's gooo", false, 2895, "Maya Torres"),
-                          m("What do I need to bring?", true, 2890),
-                          m("Sleeping bag, warm layers, snacks", false, 2885, "Dev Patel"),
-                          m("I'll handle the s'mores", false, 2880, "Maya Torres"),
-                          m("Who's driving?", true, 190),
-                          m("I can take my car, fits 4", false, 185, "Dev Patel"),
-                          m("Leaving at 5pm Friday to beat traffic", false, 184, "Dev Patel"),
-                          m("Works for me 👍", false, 180, "Maya Torres")
+                      Conversation(key: "maud", name: "Maud Pennick", emoji: "🕯️", c1: 0xFFD66B, c2: 0xE89B2D,
+                                   pinned: true, unread: true, live: true, messages: [
+                          m("Good evening dear, it's Maud Pennick from the lighthouse. Edric's shadow has slipped off again. I found its outline in chalk on the floor of the Drowned Lamb.", false, 12000),
+                          m("Mrs. Pennick. Shadows are homing creatures. They return to what is warm. I'll look into it. 🌙", true, 11990),
+                          m("Thank you dear. I'll put the kettle on.", false, 11985),
+                          m("Still working on it, Mrs. Pennick. 🌙", true, 5000),
+                          m("Ilsabet dear, are you well? The tide is wrong and the gulls are all facing inland. Any news on Edric's shadow?", false, 200)
                       ]),
-                      Conversation(name: "Dev Patel", messages: [
-                          m("Hey, did you get a chance to look at the proposal?", false, 4400),
-                          m("Just finished. Left a few comments in the doc", true, 4390),
-                          m("Awesome, thanks. Mostly formatting stuff?", false, 4385),
-                          m("Yeah, and the budget section needs a second pass", true, 4380),
-                          m("On it", false, 4379)
+                      Conversation(key: "delphine", name: "Delphine Oakes", emoji: "📜", c1: 0xCDBB9F, c2: 0x8E7A5C,
+                                   unread: true, live: true, messages: [
+                          m("Ms Vesper, Delphine Oakes, Guildhall Registry. I would like to discuss a private matter. A charm. For my husband.", false, 9000),
+                          m("Discretion is included in the fee, Registrar Oakes. What manner of charm? 🌙", true, 8990),
+                          m("Affection. He had become distant. Absorbed in crumpets.", false, 8985),
+                          m("A love charm is a blunt tool. Are you certain?", true, 8980),
+                          m("Entirely.", false, 8975),
+                          m("Then one charm, one cup of tea, three drops. Do not exceed three. 🌙", true, 8970),
+                          m("I may have exceeded three.", false, 5500),
+                          m("How many?", true, 5495),
+                          m("Seven. In fairness the dropper was faulty.", false, 5490),
+                          m("Do not let him look at anything shiny.", true, 5485),
+                          m("He is in love with the toaster. He has named her Brigitte.", false, 4900),
+                          m("Do not touch the toaster. I will come by on Friday. 🌙", true, 4890),
+                          m("Ms Vesper? It is now Saturday.", false, 3000),
+                          m("He proposed to her. Brigitte has a hat. Please advise.", false, 120)
                       ]),
-                      Conversation(name: "Pizza Palace", messages: [
-                          m("Your order has been received! Estimated delivery: 35 min.", false, 140),
-                          m("Your driver is on the way 🍕", false, 115),
-                          m("Your order has been delivered. Enjoy!", false, 100)
+                      Conversation(key: "moonmail", name: "Moon Mail", emoji: "🌙", c1: 0x8E8EF5, c2: 0x3A3A8C,
+                                   messages: [
+                          m("Moon Mail: A parcel is waiting for Ilsabet Vesper at the Crooked Gate. Sender: C. Rook. Contents: one black feather.", false, 3200),
+                          m("Moon Mail: Delivery attempted. Recipient not found. Left with the cat.", false, 2900)
                       ]),
-                      Conversation(name: "Dr. Kim's Office", messages: [
-                          m("Reminder: you have an appointment on Thursday at 2:30 PM. Reply C to confirm.", false, 9000),
-                          m("C", true, 8990),
-                          m("Thanks! See you then.", false, 8989)
+                      Conversation(key: "bank", name: "Bank of Ash", emoji: "🪙", c1: 0x9A9AA0, c2: 0x48484A,
+                                   unread: true, messages: [
+                          m("Bank of Ash: Your balance stands at 1,404 small wishes. Thank you for banking in smoke.", false, 10000),
+                          m("Bank of Ash: Reminder. Your obligation to C. Rook (Third Wish) falls due at the next dawn.", false, 90)
                       ]),
-                      Conversation(name: "Jake Morrison", messages: [
-                          m("Bro are you coming to the thing on Friday", false, 10200),
-                          m("What thing", true, 10190),
-                          m("The thing!!", false, 10189),
-                          m("Oh THE thing. Yeah I'll be there", true, 10185),
-                          m("Legend", false, 10184)
-                      ]),
-                      Conversation(name: "86753", unread: true, messages: [
-                          m("Your verification code is 482913. Don't share it with anyone.", false, 25)
+                      Conversation(key: "tam", name: "Old Tam", emoji: "🌦️", c1: 0x64D2FF, c2: 0x0A84FF,
+                                   messages: [
+                          m("Rain Thursday. Sleet Friday. A small hurricane Saturday if you want it.", false, 14000),
+                          m("Make it a drizzle, Tam. 🌙", true, 13990),
+                          m("Drizzle it is. The cost is a song.", false, 13985),
+                          m("You'll have it Tuesday.", true, 13980)
                       ])
                   ]
               }
+
+              // MARK: personas
+
+              static let personas: [String: Persona] = [
+                  "pip": pip, "corvin": corvin, "maud": maud, "delphine": delphine, "ilsabet": ilsabet
+              ]
+
+              // PIP: the apprentice. Lowercase, quick, scared and covering for it.
+              static let pip = Persona(
+                  key: "pip", name: "Pip", emoji: "🦊", c1: 0xFFB340, c2: 0xFF7A00,
+                  intents: [
+                      intent("greet", ["hello", "hi", "hey", "yo", "hiya", "greetings", "sup"],
+                             ["ILSABET?? ok no. you never say hi.||who is this",
+                              "hi?? who IS this. why do you have her phone",
+                              "hello again. still need to know who you are"]),
+                      intent("claim", ["its me", "it is me", "i am ilsabet", "im ilsabet", "ilsabet here", "this is ilsabet", "im back", "i am back", "its ilsabet"],
+                             ["nope.||ilsabet signs everything with a little moon and she'd already be yelling about the shop door. so who are you really",
+                              "still no. she'd have opened with a swear word and a moon. who has her phone"],
+                             w: 1.2, sets: ["pip_doubt"]),
+                      intent("found", ["found", "found it", "picked up", "picked it up", "lying", "on the ground", "bench", "street", "dropped", "belongs", "whose phone", "stumbled", "not ilsabet", "im not ilsabet", "i am not ilsabet"],
+                             ["found it?? FOUND it?||ok. ok ok ok. don't hang up. don't throw it in a river. don't let anything with feathers touch it||that phone doesn't unlock for just anyone. the whisper chose you||so. who are you?",
+                              "you're still holding it, right? keep holding it. please"],
+                             w: 1.1, sets: ["told_pip"]),
+                      intent("name", ["__name__"],
+                             ["{name}. ok {name}. i'm going to trust that, which is bad business for a fox||where did you get her phone?",
+                              "{name}. hi. sorry i'm a mess. ask me anything"],
+                             w: 3, sets: ["told_pip"]),
+                      intent("who", ["who are you", "whos this", "who is this", "who am i talking to", "what are you", "who is pip", "whats your name", "who dis"],
+                             ["pip. apprentice. fox. i do the books and the biting||your turn. who are you and why do you have this phone"]),
+                      intent("missing", ["where is she", "where is ilsabet", "where did she go", "what happened", "whats going on", "whats happening", "missing", "vanished", "disappeared", "gone", "owner", "who owns", "who is ilsabet", "whos ilsabet", "ilsabet"],
+                             ["ilsabet vesper. wishwright. the sign on the door says 'small magics for large problems'||three nights ago, the hollow moon, she put on her coat and walked out. didn't take the whisper. she NEVER leaves the whisper||the shop locked itself behind her. from the outside. i've been sleeping on the counter since",
+                              "i don't know where she is. i only know where she isn't. here. answering me"],
+                             sets: ["knows_missing"]),
+                      intent("whisper", ["phone", "whisper", "magic", "magical", "enchanted", "spell", "weird", "strange", "cursed", "how does this work", "what is this", "whats this"],
+                             ["the whisper. ilsabet's phone. looks like a phone, isn't one||it can text anyone who ever made a wish. anyone. anywhere. alive, dead, feathered, whatever||that's why the clients keep texting. they think she's still taking orders"],
+                             sets: ["knows_whisper"]),
+                      intent("corvin", ["corvin", "crow", "crow king", "feather", "rook", "bird"],
+                             ["corvin rook. the crow king. he's why the shop is locked||years ago ilsabet borrowed a wish from him. a THIRD wish, the kind you're not supposed to be able to borrow. she wished for the whisper||it's due at dawn. if it's not settled, the whisper goes to him. and everything it touches. the clients. the shop. me"],
+                             sets: ["knows_debt"]),
+                      intent("hill", ["hollow hill", "hill", "hiding", "portal", "pocket", "door"],
+                             ["the hollow hill. a pocket of nowhere. it opens for an hour at moonrise, from the outside, for someone who has three things||the word. the name. the choice||ilsabet went in to stall him. she can't open it from the inside"],
+                             sets: ["knows_hill"]),
+                      intent("help_early", ["help", "can i help", "let me help", "how can i help", "what can i do", "what do you need", "ill help", "i will help", "want to help", "how do i help", "what should i do", "fix this", "save her", "find her"],
+                             ["you can help by telling me who you are. i don't take orders from strangers or phones"],
+                             blocks: ["told_pip"]),
+                      intent("help", ["help", "can i help", "let me help", "how can i help", "what can i do", "what do you need", "ill help", "i will help", "want to help", "how do i help", "what should i do", "fix this", "save her", "find her", "rescue her"],
+                             ["you'd actually help? a stranger?||...ok. here's what i've got. the hollow hill needs three things. the word, the name, the choice||the WORD: maud pennick has it. ilsabet trusted her to guard it. lighthouse widow, very sweet, extremely slow to get to the point||the NAME: delphine oakes runs the guildhall register of true names. corvin's is in there||the choice is yours. later||start with maud and delphine. they've both been texting this phone for days. be nice. they're clients, not suspects",
+                              "we've got a plan. maud for the word. delphine for the name. corvin last"],
+                             needs: ["told_pip"], sets: ["quest", "knows_hill"]),
+                      intent("status", ["what now", "whats next", "what next", "next step", "what do i do", "where do i start", "clues", "progress", "so far", "hint", "stuck", "im stuck", "where do i begin", "what do we do"],
+                             ["ok. {hint}"]),
+                      intent("items", ["the word", "the name", "the choice", "three things", "the three", "what three", "what are the three"],
+                             ["the word is maud's. the name is in delphine's register. the choice is yours, at the end. that's all i know||ilsabet says 'a fox should know just enough to be loyal'"]),
+                      intent("maud", ["maud", "pennick", "lighthouse", "widow"],
+                             ["mrs pennick. sweetest client we have. her husband edric's shadow keeps running off. ilsabet said shadows come home to what's warm but never finished the job||if you help her, be gentle. and be patient. she'll tell you about the tea first"]),
+                      intent("delphine", ["delphine", "oakes", "registrar", "register", "guildhall", "toaster", "brigitte"],
+                             ["delphine oakes. guildhall registrar. she overdosed her husband with a love charm and now he's in love with a toaster||don't laugh. ok you can laugh. but not at her. she keeps the register of true names. everyone's. even crows'"]),
+                      intent("scared", ["scared", "afraid", "worried", "dangerous", "danger", "are you ok", "are you okay", "you ok", "how are you"],
+                             ["i'm fine. i'm a fox. foxes are famously fine||(i'm not fine)",
+                              "not fine but functioning. it's a family trait"]),
+                      intent("fox", ["fox", "tail", "bite", "spirit", "familiar", "pet you"],
+                             ["yes i'm a fox. no you can't pet me. ok maybe over text",
+                              "i have a tail. it's not relevant. why are we talking about my tail"]),
+                      intent("when", ["dawn", "deadline", "how long", "how much time", "time left", "moonrise", "hurry", "how soon"],
+                             ["dawn. moonrise opens the hill, dawn closes the bargain. so: tonight. hurry, but also be careful. both"]),
+                      intent("real", ["prank", "fake", "roleplay", "pretend", "is this real", "is this a game", "is this a joke", "seriously"],
+                             ["it's not a prank. i wish it were. i'd be so good at pranks",
+                              "this is real. the feather on the chair was real. i'd send a picture but the whisper only does words"]),
+                      intent("ready", ["i have both", "got both", "have them both", "i have the word and the name", "i got the word", "i got the name", "i have the word", "i have the name", "got the word", "got the name"],
+                             ["then go. corvin. say the word, then the name. exactly. i'll be here"],
+                             w: 1.5, needs: ["has_word", "has_name"]),
+                      intent("thanks", ["thanks", "thank you", "thx", "appreciate"],
+                             ["don't thank me yet. thank me after dawn",
+                              "you're welcome. text me if anything weird happens. everything is weird but like, new weird"]),
+                      intent("bye", ["bye", "goodbye", "gotta go", "brb", "later", "goodnight"],
+                             ["don't go far. dawn is coming",
+                              "brb is a promise. i'm holding you to it"])
+                  ],
+                  fallbacks: [
+                      "sorry, i got lost. say it a different way?",
+                      "my brain is mostly fear right now. try again, simpler?",
+                      "hm. i'm a fox, not a lawyer. what do you mean",
+                      "ok i'm not following but i'm listening. ask me about ilsabet, corvin, the hill, or what to do next"
+                  ],
+                  hint: { f in
+                      if f.contains("hill_open") { return "the hill's open. corvin's waiting. choose: free her, keep the whisper, or break it" }
+                      if f.contains("has_word") && f.contains("has_name") { return "you've got both. go text corvin. say the word, then the name" }
+                      if !f.contains("told_pip") { return "you could tell me who you are. i won't bite. probably" }
+                      if !f.contains("knows_missing") { return "ask me what happened to ilsabet" }
+                      if !f.contains("quest") { return "you could offer to help. just saying" }
+                      if !f.contains("has_word") { return "maud pennick has the word. she's a lighthouse widow. she'll want help with her husband's shadow first" }
+                      if !f.contains("has_name") { return "delphine oakes keeps the register of names. corvin's is in there. she's got a husband problem" }
+                      return nil
+                  },
+                  endings: [
+                      "end_return": ["SHE'S BACK. i'm not crying. foxes don't", "come by the shop sometime. there's a standing invitation and a standing lamp"],
+                      "end_keep": ["so... boss?", "don't tell ilsabet i cried. and don't bring me crumpets at 3am", "the sign says 'new management' now. it looks good"],
+                      "end_break": ["it's so quiet", "it's still a phone. it just isn't magic anymore. i think quiet is ok"],
+                      "end_dark": ["what did you do.", "the shop door is open now. i can hear wings.", "..."]
+                  ])
+
+              // CORVIN: the Crow King. Formal, patient, a little amused.
+              static let corvin = Persona(
+                  key: "corvin", name: "Corvin R.", emoji: "🐦‍⬛", c1: 0x6E6BF0, c2: 0x1C1C3A,
+                  intents: [
+                      intent("greet", ["hello", "hi", "hey", "greetings", "good evening", "good morning"],
+                             ["Hello is a small word for a large night.", "Courtesy. How rare. And how useless."]),
+                      intent("claim", ["its me", "i am ilsabet", "im ilsabet", "this is ilsabet", "ilsabet here", "im back"],
+                             ["No. Vesper's thumbs are crueler than yours. You type like someone who still hopes.",
+                              "I have wagered on Vesper for thirty years. I know her cadence. You are not she."],
+                             w: 1.2, sets: ["corvin_doubt"]),
+                      intent("who", ["who are you", "who is this", "whos this", "what are you", "your name", "who is corvin"],
+                             ["I am the one your predecessor owes.||Corvin Rook. The Crow King, if the old ballads are to be believed. They rarely are, but they flatter."]),
+                      intent("found", ["found", "picked up", "dropped", "bench", "street", "belongs", "lying", "not ilsabet", "im not ilsabet"],
+                             ["Found. How quaint. Nothing is found, little thief. It is only handed to the next hand.||The Whisper has chosen you. Poor thing. It does not choose gently."],
+                             w: 1.1, sets: ["met_corvin"]),
+                      intent("name", ["__name__"],
+                             ["{name}. A small name in a large mouth.||I will remember it. I remember everything that is promised to me."],
+                             w: 3, sets: ["met_corvin"]),
+                      intent("where", ["where is she", "where is ilsabet", "where is vesper", "ilsabet", "vesper", "missing", "hiding", "gone", "where did she go"],
+                             ["Hiding. Poorly, and with great cleverness.||The Hollow Hill. She imagines I cannot wait. I have waited through three centuries of kings. I can wait until dawn."],
+                             sets: ["knows_hill"]),
+                      intent("debt", ["what do you want", "what is it you want", "debt", "owe", "owed", "bargain", "wish", "third wish", "what do you need", "whats your problem", "why are you doing this"],
+                             ["Vesper borrowed a Third Wish from me. She wished for this device, a voice that reaches anyone who ever wanted anything. It was a fine wish.||The loan is due at dawn.",
+                              "As I said. The Whisper, returned. That is the whole of it. I am a simple creature with a simple appetite."]),
+                      intent("offer", ["give it", "give me the phone", "hand it", "what if", "let me go", "walk away", "negotiate", "deal", "terms", "trade", "what will it take", "what would it take", "how do i stop", "make a deal", "alternative"],
+                             ["Then hear my terms.||You give me the Whisper. You walk away. I forgive Vesper's debt, and yours, and any you inherit.||Say yes and it is done. Say no and I will find another road to it."],
+                             blocks: ["hill_open"], sets: ["corvin_offer"]),
+                      intent("accept", ["yes", "deal", "i accept", "accept", "take it", "its yours", "you can have it", "i agree", "agreed", "ok deal", "sure", "fine"],
+                             ["Wise hand. Wise, tired hand.||Carry the Whisper to the river at the Gull's Stair and open your fingers. Do not look down. Do not look back.||Thank you, {name}. I will remember you kindly. For about a century."],
+                             last: "offer", sets: ["end_dark"]),
+                      intent("refuse", ["no", "never", "refuse", "no deal", "wont", "will not", "not a chance", "absolutely not", "nope"],
+                             ["Then you are brave or uninformed. Both are useful.||The offer holds until dawn. It is a very patient offer."],
+                             last: "offer"),
+                      intent("threat", ["or what", "threat", "threaten", "hurt", "kill", "scared", "afraid", "what will you do", "what happens", "what happens at dawn", "consequence"],
+                             ["A flock is only a promise of wings.||At dawn the Whisper becomes mine, and with it every wish it has ever touched. The clients. The shop. The fox.||I would very much rather it were a kindness."]),
+                      intent("partial_word", ["ember and tide"],
+                             ["A word without a name is a key without a door.||Who taught you that? Pennick. Of course. That lamp-keeper always did talk to the tide."],
+                             blocks: ["hill_open"]),
+                      intent("partial_name", ["aldous rook", "aldous"],
+                             ["That name. Where did you...||No. Do not tell me. A name alone cannot open the hill. It wants its word."],
+                             blocks: ["hill_open"]),
+                      intent("final", ["ember and tide", "aldous rook"],
+                             ["...||There it is. My name in a stranger's mouth. Thirty years since anyone dared.||The Hill is opening. I can hear it unlocking, the old thing. It is done.||But a bargain is a knot, and knots wish to be cut. Choose, Keeper-that-would-be: free Vesper, keep the Whisper, or break it altogether.||Choose well. It is the only part of this I cannot predict."],
+                             w: 3, blocks: ["hill_open"], all: ["ember and tide", "aldous rook"], sets: ["hill_open"]),
+                      intent("free", ["free", "free her", "free vesper", "free ilsabet", "give it back", "return it", "return the whisper", "bring her back", "let her go", "hand it back", "save her", "rescue her", "save ilsabet", "save vesper"],
+                             ["Vesper, then. How sentimental.||The bargain is void. The Whisper goes home to its mistress. I withdraw my claim, and my feathers.||Tell her the Crow King says the lamp is hers."],
+                             needs: ["hill_open"], sets: ["end_return"]),
+                      intent("keep", ["keep it", "keep the whisper", "keep the phone", "ill keep", "i will keep", "be the keeper", "become the keeper", "i am the keeper", "im the keeper", "ill be the keeper", "i will be the keeper", "take the job", "take over", "i keep it", "keeper", "keep"],
+                             ["A Keeper. Again. Splendid. And so soon after the last one.||The debt is rewritten in your name, {name}. A smaller sum. A longer fuse. We will speak again."],
+                             needs: ["hill_open"], sets: ["end_keep"]),
+                      intent("break", ["break", "break it", "destroy", "destroy it", "smash", "burn", "end it", "end the whisper", "unbind", "cut the knot", "undo", "no more magic", "throw it away", "be done", "drown"],
+                             ["The knot cut, and the thread with it.||So be it. I will not collect what no longer exists.||You have taken a small magic from a large world. I hope it was worth the cost."],
+                             needs: ["hill_open"], sets: ["end_break"]),
+                      intent("hill", ["hollow hill", "hill", "word", "name", "key", "open", "door"],
+                             ["The Hill opens to those who bring it three things: a Word, a Name, and a Choice. I will not say more. It would spoil the sport."]),
+                      intent("friends", ["pip", "fox", "maud", "delphine", "pennick", "oakes"],
+                             ["Ah. The fox. A brave little thing with a poor sense of danger.",
+                              "Pennick. Oakes. Pip. Vesper keeps small, precious company. Such things make for excellent leverage."]),
+                      intent("insult", ["idiot", "stupid", "hate you", "bastard", "jerk", "freak", "monster", "liar"],
+                             ["Insults. How lovely. Few have the courage to give me a gift.", "I have been cursed by queens. Try again."]),
+                      intent("when", ["when", "dawn", "time left", "how long", "deadline", "tonight"],
+                             ["Dawn. The sun rises at 6:14 and I am punctual."]),
+                      intent("bye", ["bye", "goodbye", "goodnight", "leaving"],
+                             ["Dawn does not say goodbye. It simply arrives."]),
+                      intent("polite", ["please", "thanks", "thank you"],
+                             ["Courtesy again. I begin to like you. This is a problem for us both."])
+                  ],
+                  fallbacks: [
+                      "Speak plainly. I have dined on riddles for centuries and I am full.",
+                      "The Whisper is in your hand. Use it with intent, little thief.",
+                      "I enjoy a pause as much as the next crow, but dawn is on its way.",
+                      "Ask me what I want. Ask me where she is. Or tell me what you intend to do with the thing in your hand."
+                  ],
+                  hint: { f in
+                      if f.contains("hill_open") { return "Choose, Keeper-that-would-be. Free Vesper, keep the Whisper, or break it." }
+                      if f.contains("has_word") && f.contains("has_name") { return "You carry a word and a name. Speak them to me. Both, together." }
+                      return "Pennick tends a lamp that remembers a word. Oakes keeps a ledger that remembers names. Neither would help a thief. They might help a friend."
+                  },
+                  endings: [
+                      "end_return": ["Our business is concluded.", "Do not text me again. I may answer."],
+                      "end_keep": ["Keeper. We will speak at the next debt.", "Your thumb is in the ledger now."],
+                      "end_break": ["Silence suits the Whisper. It never suited me.", "The thread is cut. Do not look for me."],
+                      "end_dark": ["Dawn comes. Throw it in the river.", "You have done well, {name}."]
+                  ])
+
+              // MAUD: gentle, rambling, kind. Lighthouse widow whose husband's shadow ran off.
+              static let maud = Persona(
+                  key: "maud", name: "Maud Pennick", emoji: "🕯️", c1: 0xFFD66B, c2: 0xE89B2D,
+                  intents: [
+                      intent("greet", ["hello", "hi", "hey", "good morning", "good evening", "evening", "morning"],
+                             ["Oh! Hello, dear. I thought it was Ilsabet. You're not Ilsabet, are you? You type so quickly.",
+                              "Hello again, dear. The kettle's just boiled."]),
+                      intent("claim", ["its me", "i am ilsabet", "ilsabet here", "im ilsabet", "this is ilsabet", "im back"],
+                             ["Ilsabet dear, thank goodness, you've been so quiet||...hold on. You haven't put your little moon. Ilsabet always signs off with a moon. Who is this, dear?"],
+                             w: 1.2),
+                      intent("who", ["who are you", "who is this", "whos this", "what is your name", "whats your name"],
+                             ["Maud Pennick, dear. Of the Gull's Rest lighthouse. Widow-of-sorts. Edric isn't quite gone, just misplaced."]),
+                      intent("found", ["found", "picked up", "dropped", "bench", "belongs", "not ilsabet", "im not ilsabet"],
+                             ["Found it! Oh, how lucky. And honest enough to write. Bless you.||Ilsabet is missing, then? I thought as much. The gulls have been facing inland for days."],
+                             w: 1.1, sets: ["told_maud"]),
+                      intent("name", ["__name__"],
+                             ["{name}. What a lovely name. Edric would have liked you. He liked anyone who stayed for tea."],
+                             w: 3, sets: ["told_maud"]),
+                      intent("shadow", ["shadow", "edric", "husband", "tavern", "pub", "drowned lamb", "chalk", "where is edric"],
+                             ["Edric's shadow went missing in March. It started small. A slouch at the door. Then it was found sitting under the lamplighter outside the Drowned Lamb.||I'd fetch it myself but my knees. Ilsabet said shadows come home to what's warm. She never said what 'warm' meant, exactly.||Do you have any ideas, dear? I'm quite out."],
+                             blocks: ["has_word"], sets: ["maud_asked"]),
+                      intent("shadow_after", ["shadow", "edric", "husband", "tavern", "pub", "where is edric"],
+                             ["He's home, dear. Lying across the hearth like a cat. I think he's sulking."],
+                             w: 1.5, needs: ["has_word"]),
+                      intent("suggest", ["light", "lamp", "candle", "lantern", "fire", "warm", "glow", "hearth", "porch", "window", "bright", "flame", "lit", "burning", "warmth", "fireplace"],
+                             ["Oh! A light. Of course. I used to leave the lighthouse lamp on for him every night, and the shadow always came straight home. But the lamp's been dark since he went.||Let me try the lamp in the window. Oh, I do hope... give me a moment, dear. I'll let you know.",
+                              "I've lit it. Now we wait. Bless you."],
+                             w: 1.2, blocks: ["maud_light"], sets: ["maud_light"]),
+                      intent("word_ask", ["word", "password", "secret", "guard", "guarding", "phrase", "left with you", "left you", "hollow hill", "hill"],
+                             ["Ilsabet did leave me something to guard. A word. 'For when the Whisper changes hands,' she said. I'm not sure it's you, dear. You seem lovely, but I'm very old and I have been wrong about people before.||Help me with Edric's shadow, and we'll see. A word for a shadow. That seems fair."],
+                             blocks: ["has_word"], sets: ["maud_word_asked"]),
+                      intent("word_again", ["word", "password", "secret", "phrase", "hollow hill", "hill"],
+                             ["I told you already, dear. 'Ember and tide'. Don't write it down. Words in ink get stolen."],
+                             w: 1.5, needs: ["has_word"]),
+                      intent("tea", ["tea", "kettle", "biscuits", "cup"],
+                             ["It's Earl Grey. Edric always preferred Lapsang, which smells of a fire in a wet field. I never understood it."]),
+                      intent("lighthouse", ["lighthouse", "gull", "gulls", "tide", "sea", "harbor", "harbour", "sailors", "ships"],
+                             ["The lamp at Gull's Rest hasn't been lit since Edric's shadow left. The gulls are all facing inland. I don't like it. Birds know."]),
+                      intent("missing", ["where is ilsabet", "ilsabet", "missing", "hiding", "where is she"],
+                             ["She hasn't answered in days. She's always answered. Even when the storm took the cables she answered, somehow, by pigeon.||I'm worried. Is she in trouble? She looked so tired the last time."]),
+                      intent("corvin", ["corvin", "crow", "feather", "rook"],
+                             ["The Crow King? Oh dear. Edric's father used to say if a crow looks at your house, shut the shutters. Is he involved in this? Oh, Ilsabet..."]),
+                      intent("how", ["how are you", "are you ok", "you ok"],
+                             ["Oh, I'm fine, dear. The knees ache and the gulls are rude. But I'm well enough."]),
+                      intent("thanks", ["thanks", "thank you", "bless", "kind"],
+                             ["It's no trouble, dear. Nothing's trouble when you're lonely and the house is quiet."]),
+                      intent("bye", ["bye", "goodbye", "goodnight"],
+                             ["Goodnight, dear. Mind the stairs. I'll text you when the lamp has had a chance to work."])
+                  ],
+                  fallbacks: [
+                      "Sorry dear, my hearing's not what it was. Could you say that another way?",
+                      "I'm a little muddled tonight. Is this about Edric's shadow? Or Ilsabet?",
+                      "Hm. Have a biscuit and try again."
+                  ],
+                  hint: { f in
+                      if f.contains("has_word") { return "He's home, dear. That's all I wanted." }
+                      if f.contains("maud_light") { return "The lamp's lit. Give it a little time, dear." }
+                      if f.contains("maud_asked") { return "Think warm, dear. Think of what a shadow comes home to." }
+                      return "Ask me about Edric's shadow, dear. It's the one thing I can't stop talking about."
+                  },
+                  endings: [
+                      "end_return": ["Ilsabet came by with a pie! A pie! She's thin as a lamp wick.", "Edric says thank you, from the hearth."],
+                      "end_keep": ["Dear {name}, I always hoped the Whisper would find someone kind.", "Edric's shadow is purring. Almost."],
+                      "end_break": ["The gulls are facing the sea again. I think that's good.", "I'll miss the little buzzing. Thank you, dear."],
+                      "end_dark": ["The lamp has gone out. I don't understand. The gulls are leaving.", "Edric's shadow has stopped moving."]
+                  ])
+
+              // DELPHINE: the registrar. Formal, exhausted, dry.
+              static let delphine = Persona(
+                  key: "delphine", name: "Delphine Oakes", emoji: "📜", c1: 0xCDBB9F, c2: 0x8E7A5C,
+                  intents: [
+                      intent("greet", ["hello", "hi", "hey", "good morning", "good evening"],
+                             ["Good evening. Is this Ms Vesper? I have sent several messages.",
+                              "Hello. Yes. Yes, I'm still here. Unfortunately so is the toaster."]),
+                      intent("claim", ["its me", "i am ilsabet", "im ilsabet", "this is ilsabet", "ilsabet here", "im back"],
+                             ["Ms Vesper. Finally. About time.||...forgive me. You have omitted the moon. Ms Vesper never omits the moon. She is sentimental about it. Who is this?"],
+                             w: 1.2),
+                      intent("who", ["who are you", "who is this", "whos this", "whats your name", "what is your name"],
+                             ["Delphine Oakes. Registrar, Guildhall. I keep the Register of True Names. It is as dull as it sounds."]),
+                      intent("found", ["found", "picked up", "dropped", "not ilsabet", "im not ilsabet", "bench", "belongs"],
+                             ["I see. So you are a stranger in possession of an enchanted device belonging to a missing person. I am legally required to say that sounds like a crime.||I am also desperate. Can you help with a husband?"],
+                             w: 1.1, sets: ["told_delphine"]),
+                      intent("name", ["__name__"],
+                             ["{name}. Noted. I will enter it in the register, as I do for everyone. Do not be alarmed. It is habit."],
+                             w: 3, sets: ["told_delphine"]),
+                      intent("husband", ["husband", "bram", "toaster", "brigitte", "charm", "potion", "married", "spouse"],
+                             ["Bram. My husband. Forty-one years of marriage and a mortgage, and now he sings to the toaster. He has named her Brigitte. She has a hat.||I used a love charm. I may have exceeded the recommended three drops. By four. Ms Vesper said 'do not touch the toaster' and then vanished, which I take personally.||Is there anything you can do, {name}? I am exhausted."],
+                             blocks: ["delphine_owes"], sets: ["delphine_asked"]),
+                      intent("husband_after", ["husband", "bram", "toaster", "brigitte", "charm", "potion", "married", "spouse"],
+                             ["Bram is better. He laughed so hard he sat on the cat. He apologised to the toaster, but he has come back to himself. Mostly. He still calls her Brigitte on occasion."],
+                             w: 1.5, needs: ["delphine_owes"]),
+                      intent("fix", ["laugh", "laughter", "joke", "funny", "humour", "humor", "tickle", "giggle", "comedy", "pun", "amuse", "silly", "surprise", "startle", "shock", "scare"],
+                             ["Laughter. Hm. Ms Vesper did say once that a love charm is rather like a hiccup. One startles it away. Surprise it. Break the spell with something unexpected.||I shall tell him the one about the barrister and the badger. It always gets him. Give me a moment.",
+                              "I will try. Wish me luck."],
+                             w: 1.2, blocks: ["delphine_try"], sets: ["delphine_try"]),
+                      intent("name_req_early", ["corvin", "crow king", "crow", "rook", "register", "true name", "his name", "guildhall", "look him up", "look up"],
+                             ["I cannot release a true name to a stranger. Statute 12. Unless you have done something for me. A favour exchanged is a favour owed, and I always pay my debts.",
+                              "Not without reason. I am a civil servant, not a fool. Come back when I owe you something."],
+                             blocks: ["delphine_owes"]),
+                      intent("name_req", ["corvin", "crow king", "crow", "rook", "register", "true name", "his name", "guildhall", "look him up", "look up", "the name"],
+                             ["Corvin Rook. Crow King, Lord of Feathers, Keeper of Unpaid Debts. Registered under the Old Statutes, folio 41.||His true name, the one he was given before he was a king: Aldous Rook.||You did not hear it from me. I am a civil servant. I will deny it under oath and probably over tea."],
+                             w: 1.2, needs: ["delphine_owes"], blocks: ["has_name"], sets: ["has_name"]),
+                      intent("name_again", ["corvin", "crow king", "crow", "rook", "true name", "his name", "the name", "aldous"],
+                             ["Aldous Rook. Do be careful with it. Names are not toys."],
+                             w: 1.5, needs: ["has_name"]),
+                      intent("ilsabet", ["where is ilsabet", "ilsabet", "missing", "vesper"],
+                             ["Ms Vesper has been unreachable since Saturday. I filed it as a missing persons case with the Guildhall. They asked 'is she a person?' and I did not have a good answer."]),
+                      intent("how", ["how are you", "you ok", "are you ok"],
+                             ["I am a registrar of true names and the wife of a man in love with a small appliance. I am managing."]),
+                      intent("thanks", ["thanks", "thank you"],
+                             ["Do not thank me. Thank you. No, wait. I mean to say thank you. I am tired."]),
+                      intent("bye", ["bye", "goodbye", "goodnight"],
+                             ["Good evening. The toaster and I will be here."])
+                  ],
+                  fallbacks: [
+                      "Could you rephrase that? I am a civil servant. I need things in triplicate.",
+                      "Hm. I am not sure what that means. Is this about the toaster or the Register?",
+                      "I am sorry, I am quite tired. Do you need something from the Register or are you here about my husband?"
+                  ],
+                  hint: { f in
+                      if f.contains("has_name") { return "I have given you what I can." }
+                      if f.contains("delphine_owes") { return "I owe you a favour. The Register is at your disposal." }
+                      if f.contains("delphine_try") { return "I have tried your idea. Give it a moment." }
+                      if f.contains("delphine_asked") { return "A love charm is rather like a hiccup, Ms Vesper once said. One cures them by surprise." }
+                      return "Ask about my husband. Everyone does, eventually."
+                  },
+                  endings: [
+                      "end_return": ["Ms Vesper has settled her account. I have closed the file. Bram sends regards from the toaster.", "I will deny all of this at the Guildhall."],
+                      "end_keep": ["I do not know your title. 'Keeper' will do. The register will be updated.", "Bram says hello. He is still a bit off, but in a good way."],
+                      "end_break": ["I have updated the register. 'Whisper: dissolved.' It is the first time I have written that.", "Thank you. I mean it, in triplicate."],
+                      "end_dark": ["The register has gone strange. The ink is moving.", "I do not like this. I do not like this at all."]
+                  ])
+
+              // ILSABET: only appears once the story ends.
+              static let ilsabet = Persona(
+                  key: "ilsabet", name: "Unknown Number", emoji: "🌙", c1: 0x2C2C54, c2: 0x0F0F2D,
+                  intents: [],
+                  fallbacks: ["Later. I need a bath and a very long nap. 🌙", "Ask me tomorrow. 🌙"],
+                  hint: { _ in nil },
+                  endings: [
+                      "end_return": ["Later. Come by the shop. Bring biscuits. 🌙", "I mean it. Biscuits. 🌙"],
+                      "end_keep": ["Mind the cat. He bites. 🌙", "The sign is fine. Do not change a word. 🌙"],
+                      "end_break": ["Tell no one I said thank you. 🌙", "I am going to sleep for a week. 🌙"],
+                      "end_dark": ["..."]
+                  ])
+
+              // MARK: story beats that fire on their own when flags change
+
+              static let triggers: [Trigger] = [
+                  Trigger(id: "corvin_nudge", when: ["told_pip"], pings: [
+                      Ping(to: "corvin", text: "A new thumb on the old Whisper.||Tell me, little thief: do you know what you are holding?", delay: 14)
+                  ]),
+                  Trigger(id: "maud_success", when: ["maud_light"], pings: [
+                      Ping(to: "maud", text: "Oh! Oh, dear. It worked.||Edric's shadow came in through the keyhole and it's lying across the hearth like a cat.||I promised you a word, didn't I? Ilsabet left it with me for the day the Whisper changed hands.||'Ember and tide'. Don't write it down, dear. Words in ink get stolen.||Do take care of her, wherever she is.", delay: 18, sets: ["has_word"])
+                  ]),
+                  Trigger(id: "delphine_success", when: ["delphine_try"], pings: [
+                      Ping(to: "delphine", text: "It WORKED.||I told him the one about the barrister and the badger. He laughed for four minutes, then wept, then asked why there was a hat on the toaster.||He is himself again. Mostly.||I owe you, {name}. Whoever you are. Ask me for anything in the Register.", delay: 16, sets: ["delphine_owes"])
+                  ]),
+                  Trigger(id: "ready", when: ["has_word", "has_name"], pings: [
+                      Ping(to: "pip", text: "wait. WAIT.||you have the word AND the name?? ok. ok. corvin. text him. say them exactly, the word and then the name, in one message||he'll ask you to choose after. i can't tell you what to choose. i'm sorry", delay: 5)
+                  ]),
+                  Trigger(id: "hill", when: ["hill_open"], pings: [
+                      Ping(to: "pip", text: "the hill!!! i can hear it unlocking||it's loud. whatever you pick, pick it fast", delay: 3)
+                  ]),
+                  Trigger(id: "end_return", when: ["end_return"], pings: [
+                      Ping(to: "pip", text: "SHE'S BACK||she walked in the door with her coat on inside out and asked what we'd done to the plants||thank you. i'm not crying. foxes don't", delay: 5),
+                      Ping(to: "ilsabet", text: "Well, well.||I'm standing in my own shop, in my coat, and every plant is dead. The plants always die.||I don't know who you are, or how you taught my Whisper to say a crow's name to his face.||Thank you. 🌙", delay: 18)
+                  ]),
+                  Trigger(id: "end_keep", when: ["end_keep"], pings: [
+                      Ping(to: "pip", text: "so... boss?||i'll fix the sign. 'small magics for large problems. new management.'||don't tell ilsabet i cried", delay: 5),
+                      Ping(to: "ilsabet", text: "So it chose you. I thought it might. It likes people who have no idea what they're doing.||I'm out. Tired, alive, annoyed. The shop is yours if you want it. The sign is fine. I wouldn't change a word.||Welcome to the work. 🌙", delay: 18)
+                  ]),
+                  Trigger(id: "end_break", when: ["end_break"], pings: [
+                      Ping(to: "pip", text: "the whisper went quiet||it's still a phone. it just isn't magic anymore. no wishes. no voices||ilsabet's out. furious and relieved. mostly furious", delay: 5),
+                      Ping(to: "ilsabet", text: "I felt the Whisper die from inside the hill. I thought I would be sadder.||Thank you for not asking whether I'd have wanted that. I'd have said no. I'd have been wrong. 🌙", delay: 18)
+                  ]),
+                  Trigger(id: "end_dark", when: ["end_dark"], pings: [
+                      Ping(to: "pip", text: "what did you do||the shop door is open||i can hear wings", delay: 6)
+                  ])
+              ]
           }
           EOF
           cat > App/Views.swift <<'EOF'
           import SwiftUI
 
+          // MARK: shared pieces
+
           struct Avatar: View {
-              let initials: String
+              let convo: Conversation
               var size: CGFloat = 50
 
               var body: some View {
                   ZStack {
                       Circle().fill(LinearGradient(
-                          colors: [Color(.systemGray3), Color(.systemGray)],
+                          colors: [Color(hex: convo.c1), Color(hex: convo.c2)],
                           startPoint: .top, endPoint: .bottom))
-                      Text(initials)
-                          .font(.system(size: size * 0.4, weight: .semibold))
-                          .foregroundStyle(.white)
+                      if convo.emoji.isEmpty {
+                          Text(convo.initials)
+                              .font(.system(size: size * 0.4, weight: .semibold))
+                              .foregroundStyle(.white)
+                      } else {
+                          Text(convo.emoji).font(.system(size: size * 0.5))
+                      }
                   }
                   .frame(width: size, height: size)
               }
           }
 
+          struct GlassIcon: View {
+              let name: String
+
+              var body: some View {
+                  Image(systemName: name)
+                      .font(.system(size: 16, weight: .semibold))
+                      .foregroundStyle(.primary)
+                      .frame(width: 40, height: 40)
+                      .background(.ultraThinMaterial, in: Circle())
+                      .overlay(Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+              }
+          }
+
+          struct BubbleShape: Shape {
+              var isMe: Bool
+              var tail: Bool
+
+              func path(in rect: CGRect) -> Path {
+                  let w = rect.width
+                  let h = rect.height
+                  var p = Path()
+                  if tail {
+                      p.move(to: CGPoint(x: 20, y: h))
+                      p.addLine(to: CGPoint(x: w - 15, y: h))
+                      p.addCurve(to: CGPoint(x: w, y: h - 15), control1: CGPoint(x: w - 8, y: h), control2: CGPoint(x: w, y: h - 8))
+                      p.addLine(to: CGPoint(x: w, y: 15))
+                      p.addCurve(to: CGPoint(x: w - 15, y: 0), control1: CGPoint(x: w, y: 8), control2: CGPoint(x: w - 8, y: 0))
+                      p.addLine(to: CGPoint(x: 20, y: 0))
+                      p.addCurve(to: CGPoint(x: 5, y: 15), control1: CGPoint(x: 12, y: 0), control2: CGPoint(x: 5, y: 8))
+                      p.addLine(to: CGPoint(x: 5, y: h - 10))
+                      p.addCurve(to: CGPoint(x: 0, y: h), control1: CGPoint(x: 5, y: h - 1), control2: CGPoint(x: 0, y: h))
+                      p.addLine(to: CGPoint(x: -1, y: h))
+                      p.addCurve(to: CGPoint(x: 12, y: h - 4), control1: CGPoint(x: 4, y: h + 1), control2: CGPoint(x: 8, y: h - 1))
+                      p.addCurve(to: CGPoint(x: 20, y: h), control1: CGPoint(x: 15, y: h), control2: CGPoint(x: 17, y: h))
+                      p.closeSubpath()
+                  } else {
+                      p = Path(roundedRect: CGRect(x: 5, y: 0, width: w - 5, height: h), cornerRadius: 18, style: .continuous)
+                  }
+                  if isMe {
+                      return p.applying(CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w, ty: 0))
+                  }
+                  return p
+              }
+          }
+
+          struct TypingBubble: View {
+              @State private var on = false
+
+              var body: some View {
+                  HStack(spacing: 4) {
+                      ForEach(0..<3) { i in
+                          Circle()
+                              .fill(Color(.systemGray2))
+                              .frame(width: 8, height: 8)
+                              .opacity(on ? 1 : 0.3)
+                              .animation(.easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.2), value: on)
+                      }
+                  }
+                  .padding(.leading, 19)
+                  .padding(.trailing, 14)
+                  .padding(.vertical, 13)
+                  .background(BubbleShape(isMe: false, tail: true).fill(Color(.systemGray5)))
+                  .onAppear { on = true }
+              }
+          }
+
+          struct BannerView: View {
+              let b: Banner
+
+              var body: some View {
+                  HStack(spacing: 10) {
+                      ZStack {
+                          RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.green)
+                          Image(systemName: "message.fill")
+                              .font(.system(size: 14))
+                              .foregroundStyle(.white)
+                      }
+                      .frame(width: 32, height: 32)
+                      VStack(alignment: .leading, spacing: 1) {
+                          Text(b.title).font(.system(size: 15, weight: .semibold))
+                          Text(b.text).font(.system(size: 14)).lineLimit(2)
+                      }
+                      Spacer(minLength: 0)
+                  }
+                  .padding(12)
+                  .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                  .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
+                  .padding(.horizontal, 10)
+              }
+          }
+
+          // MARK: conversation list
+
           struct ContentView: View {
               @StateObject private var store = ChatStore()
+              @State private var path: [UUID] = []
               @State private var query = ""
+              @State private var showCompose = false
+              @State private var showSettings = false
 
-              var filtered: [Conversation] {
-                  let all = store.sorted
-                  if query.isEmpty { return all }
-                  return all.filter {
-                      $0.name.localizedCaseInsensitiveContains(query) ||
-                      $0.messages.contains { $0.text.localizedCaseInsensitiveContains(query) }
+              var pinned: [Conversation] { store.sorted.filter { $0.pinned } }
+
+              var rest: [Conversation] {
+                  if query.isEmpty { return store.sorted.filter { !$0.pinned } }
+                  return store.sorted.filter { c in
+                      c.name.localizedCaseInsensitiveContains(query) ||
+                      c.messages.contains { $0.text.localizedCaseInsensitiveContains(query) }
                   }
               }
 
-              var body: some View {
-                  NavigationStack {
-                      List {
-                          ForEach(filtered) { c in
-                              NavigationLink {
-                                  ChatView(id: c.id)
-                              } label: {
-                                  ConversationRow(convo: c)
+              var bottomBar: some View {
+                  HStack(spacing: 10) {
+                      HStack(spacing: 8) {
+                          Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                          TextField("Search", text: $query)
+                          if query.isEmpty {
+                              Image(systemName: "mic.fill").foregroundStyle(.secondary)
+                          } else {
+                              Button { query = "" } label: {
+                                  Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                               }
-                              .swipeActions {
-                                  Button(role: .destructive) {
-                                      store.delete(c.id)
-                                  } label: {
-                                      Label("Delete", systemImage: "trash")
+                          }
+                      }
+                      .padding(.horizontal, 14)
+                      .padding(.vertical, 12)
+                      .background(.ultraThinMaterial, in: Capsule())
+                      .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+
+                      Button { showCompose = true } label: {
+                          Image(systemName: "square.and.pencil")
+                              .font(.system(size: 20, weight: .medium))
+                              .foregroundStyle(.primary)
+                              .frame(width: 48, height: 48)
+                              .background(.ultraThinMaterial, in: Circle())
+                              .overlay(Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                      }
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.bottom, 4)
+              }
+
+              var body: some View {
+                  NavigationStack(path: $path) {
+                      VStack(spacing: 0) {
+                          if query.isEmpty && !pinned.isEmpty {
+                              PinnedStrip(items: pinned) { id in path.append(id) }
+                          }
+                          List {
+                              ForEach(rest) { c in
+                                  NavigationLink(value: c.id) {
+                                      ConversationRow(convo: c)
+                                  }
+                                  .swipeActions {
+                                      Button(role: .destructive) {
+                                          store.delete(c.id)
+                                      } label: {
+                                          Label("Delete", systemImage: "trash")
+                                      }
                                   }
                               }
                           }
+                          .listStyle(.plain)
                       }
-                      .listStyle(.plain)
                       .navigationTitle("Messages")
-                      .searchable(text: $query)
+                      .navigationDestination(for: UUID.self) { id in
+                          ChatView(id: id).environmentObject(store)
+                      }
                       .toolbar {
-                          ToolbarItem(placement: .navigationBarTrailing) {
-                              Button { store.compose() } label: {
-                                  Image(systemName: "square.and.pencil")
+                          ToolbarItem(placement: .navigationBarLeading) {
+                              Button { showSettings = true } label: {
+                                  GlassIcon(name: "ellipsis")
                               }
                           }
                       }
+                      .safeAreaInset(edge: .bottom) { bottomBar }
                   }
                   .environmentObject(store)
+                  .overlay(alignment: .top) {
+                      if let b = store.banner {
+                          BannerView(b: b)
+                              .onTapGesture {
+                                  path = [b.convoID]
+                                  store.banner = nil
+                              }
+                              .transition(.move(edge: .top).combined(with: .opacity))
+                      }
+                  }
+                  .animation(.spring(response: 0.4, dampingFraction: 0.85), value: store.banner)
+                  .sheet(isPresented: $showCompose) {
+                      ComposeSheet { id in path = [id] }
+                          .environmentObject(store)
+                  }
+                  .sheet(isPresented: $showSettings) {
+                      SettingsView(onReset: {
+                          path = []
+                          store.reset()
+                      })
+                      .environmentObject(store)
+                  }
+              }
+          }
+
+          struct PinnedStrip: View {
+              let items: [Conversation]
+              let open: (UUID) -> Void
+
+              var body: some View {
+                  HStack(alignment: .top, spacing: 18) {
+                      ForEach(items) { c in
+                          Button { open(c.id) } label: {
+                              VStack(spacing: 6) {
+                                  ZStack(alignment: .topLeading) {
+                                      Avatar(convo: c, size: 76)
+                                      if c.unread {
+                                          Circle().fill(imBlue)
+                                              .frame(width: 16, height: 16)
+                                              .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
+                                      }
+                                  }
+                                  Text(c.name)
+                                      .font(.caption)
+                                      .foregroundStyle(.primary)
+                                      .lineLimit(1)
+                              }
+                              .frame(width: 84)
+                          }
+                          .buttonStyle(.plain)
+                      }
+                  }
+                  .padding(.vertical, 12)
+                  .frame(maxWidth: .infinity)
               }
           }
 
@@ -250,7 +1216,7 @@ jobs:
                       Circle()
                           .fill(convo.unread ? imBlue : Color.clear)
                           .frame(width: 10, height: 10)
-                      Avatar(initials: convo.initials, size: 50)
+                      Avatar(convo: convo, size: 50)
                       VStack(alignment: .leading, spacing: 2) {
                           HStack {
                               Text(convo.name).fontWeight(.semibold)
@@ -269,143 +1235,220 @@ jobs:
               }
           }
 
+          struct ComposeSheet: View {
+              @EnvironmentObject var store: ChatStore
+              @Environment(\.dismiss) private var dismiss
+              var open: (UUID) -> Void
+              @State private var to = ""
+
+              var matches: [Conversation] {
+                  store.sorted.filter { to.isEmpty || $0.name.localizedCaseInsensitiveContains(to) }
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          HStack {
+                              Text("To:").foregroundStyle(.secondary)
+                              TextField("Name", text: $to)
+                          }
+                          Section("Suggestions") {
+                              ForEach(matches) { c in
+                                  Button {
+                                      dismiss()
+                                      open(c.id)
+                                  } label: {
+                                      HStack(spacing: 10) {
+                                          Avatar(convo: c, size: 36)
+                                          Text(c.name).foregroundStyle(.primary)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("New Message")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .cancellationAction) {
+                              Button("Cancel") { dismiss() }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // MARK: chat
+
           struct RowModel: Identifiable {
               let id: UUID
               let msg: ChatMessage
               let header: String?
-              let sender: String?
               let tight: Bool
-              let delivered: Bool
+              let tail: Bool
+              let last: Bool
           }
 
           struct ChatView: View {
               @EnvironmentObject var store: ChatStore
+              @Environment(\.dismiss) private var dismiss
               let id: UUID
               @State private var draft = ""
-              @State private var typing = false
+              @FocusState private var focused: Bool
 
-              var convo: Conversation {
-                  store.conversations.first { $0.id == id } ?? Conversation(name: "", messages: [])
-              }
+              var convo: Conversation? { store.conversations.first { $0.id == id } }
 
               func rows(for c: Conversation) -> [RowModel] {
                   var out: [RowModel] = []
                   let msgs = c.messages
                   for (i, msg) in msgs.enumerated() {
                       let prev: ChatMessage? = i > 0 ? msgs[i - 1] : nil
+                      let next: ChatMessage? = i < msgs.count - 1 ? msgs[i + 1] : nil
                       var header: String? = nil
                       if let p = prev {
                           if msg.date.timeIntervalSince(p.date) > 3600 { header = msg.date.headerLabel() }
                       } else {
                           header = msg.date.headerLabel()
                       }
-                      var sender: String? = nil
-                      if c.isGroup && !msg.isMe {
-                          if let p = prev {
-                              if p.isMe || p.sender != msg.sender { sender = msg.sender }
-                          } else {
-                              sender = msg.sender
-                          }
-                      }
-                      let tight = (prev != nil) && (prev!.isMe == msg.isMe) && header == nil && sender == nil
-                      let delivered = msg.isMe && i == msgs.count - 1
-                      out.append(RowModel(id: msg.id, msg: msg, header: header, sender: sender, tight: tight, delivered: delivered))
+                      var nextHeader = false
+                      if let n = next { nextHeader = n.date.timeIntervalSince(msg.date) > 3600 }
+                      let tail = next == nil || next!.isMe != msg.isMe || nextHeader
+                      let tight = prev != nil && prev!.isMe == msg.isMe && header == nil
+                      out.append(RowModel(id: msg.id, msg: msg, header: header, tight: tight, tail: tail, last: i == msgs.count - 1))
                   }
                   return out
               }
 
               func scrollDown(_ proxy: ScrollViewProxy) {
-                  withAnimation(.easeOut(duration: 0.25)) {
-                      proxy.scrollTo("bottom", anchor: .bottom)
+                  DispatchQueue.main.async {
+                      withAnimation(.easeOut(duration: 0.25)) {
+                          proxy.scrollTo("bottom", anchor: .bottom)
+                      }
                   }
               }
 
               func send() {
                   let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !t.isEmpty else { return }
-                  store.append(ChatMessage(text: t, isMe: true, date: Date()), to: id)
                   draft = ""
-                  let replySender = convo.messages.last(where: { !$0.isMe })?.sender
-                  let replies = ["Haha totally 😂", "Wait really??", "Sounds good!", "Ok see you then 👍",
-                                 "No way!", "Omg yes", "Can't wait!", "Let me check and get back to you",
-                                 "Lol okay", "That's so funny"]
-                  DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { typing = true }
-                  DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                      typing = false
-                      store.append(ChatMessage(text: replies.randomElement() ?? "ok", isMe: false,
-                                               date: Date(), sender: replySender), to: id)
-                  }
+                  store.send(t, to: id)
               }
 
-              var body: some View {
-                  let c = convo
+              func header(_ c: Conversation) -> some View {
+                  ZStack {
+                      VStack(spacing: 3) {
+                          Avatar(convo: c, size: 44)
+                          HStack(spacing: 3) {
+                              Text(c.name).font(.system(size: 12, weight: .medium))
+                              Image(systemName: "chevron.right")
+                                  .font(.system(size: 8, weight: .bold))
+                                  .foregroundStyle(.secondary)
+                          }
+                      }
+                      HStack {
+                          Button { dismiss() } label: { GlassIcon(name: "chevron.left") }
+                          Spacer()
+                          GlassIcon(name: "video")
+                      }
+                  }
+                  .padding(.horizontal, 14)
+                  .padding(.top, 4)
+                  .padding(.bottom, 8)
+                  .background(.ultraThinMaterial, ignoresSafeAreaEdges: .top)
+              }
+
+              var inputBar: some View {
+                  HStack(alignment: .bottom, spacing: 8) {
+                      GlassIcon(name: "plus")
+                      HStack(alignment: .bottom, spacing: 6) {
+                          TextField("iMessage", text: $draft, axis: .vertical)
+                              .lineLimit(1...5)
+                              .focused($focused)
+                              .padding(.vertical, 9)
+                              .padding(.leading, 14)
+                          if draft.isEmpty {
+                              Image(systemName: "mic.fill")
+                                  .foregroundStyle(.secondary)
+                                  .padding(.trailing, 14)
+                                  .padding(.bottom, 11)
+                          } else {
+                              Button(action: send) {
+                                  Image(systemName: "arrow.up.circle.fill")
+                                      .font(.system(size: 30))
+                                      .foregroundStyle(imBlue)
+                              }
+                              .padding(.trailing, 5)
+                              .padding(.bottom, 4)
+                          }
+                      }
+                      .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 22, style: .continuous)
+                              .stroke(Color.primary.opacity(0.1), lineWidth: 0.5)
+                      )
+                  }
+                  .padding(.horizontal, 12)
+                  .padding(.vertical, 6)
+              }
+
+              func content(_ c: Conversation) -> some View {
                   ScrollViewReader { proxy in
                       ScrollView {
                           LazyVStack(spacing: 2) {
+                              Color.clear.frame(height: 6)
                               ForEach(rows(for: c)) { row in
-                                  MessageRow(row: row)
+                                  MessageRow(row: row, status: status(for: c, row: row))
                               }
-                              if typing {
-                                  HStack {
-                                      TypingBubble()
-                                      Spacer()
-                                  }
-                                  .padding(.top, 6)
+                              if store.typing.contains(id) {
+                                  TypingBubble()
+                                      .frame(maxWidth: .infinity, alignment: .leading)
+                                      .padding(.top, 6)
                               }
                               Color.clear.frame(height: 1).id("bottom")
                           }
                           .padding(.horizontal, 12)
-                          .padding(.top, 8)
                       }
+                      .scrollDismissesKeyboard(.interactively)
                       .onAppear {
+                          store.openChat = id
                           store.markRead(id)
                           scrollDown(proxy)
                       }
-                      .onChange(of: c.messages.count) { _ in scrollDown(proxy) }
-                      .onChange(of: typing) { _ in scrollDown(proxy) }
+                      .onDisappear {
+                          if store.openChat == id { store.openChat = nil }
+                      }
+                      .onChange(of: c.messages.count) { _ in
+                          store.markRead(id)
+                          scrollDown(proxy)
+                      }
+                      .onChange(of: store.typing) { _ in scrollDown(proxy) }
+                      .onChange(of: focused) { _ in scrollDown(proxy) }
                   }
-                  .navigationTitle(c.name)
-                  .navigationBarTitleDisplayMode(.inline)
-                  .toolbar {
-                      ToolbarItem(placement: .principal) {
-                          VStack(spacing: 2) {
-                              Avatar(initials: c.initials, size: 34)
-                              Text(c.name).font(.caption2)
-                          }
+                  .background(Color(.systemBackground))
+                  .safeAreaInset(edge: .top, spacing: 0) { header(c) }
+                  .safeAreaInset(edge: .bottom, spacing: 0) { inputBar }
+              }
+
+              func status(for c: Conversation, row: RowModel) -> String? {
+                  guard row.last && row.msg.isMe else { return nil }
+                  return store.typing.contains(id) ? "Read" : "Delivered"
+              }
+
+              var body: some View {
+                  Group {
+                      if let c = convo {
+                          content(c)
+                      } else {
+                          Color(.systemBackground)
                       }
                   }
-                  .safeAreaInset(edge: .bottom) {
-                      HStack(alignment: .bottom, spacing: 8) {
-                          Image(systemName: "plus.circle.fill")
-                              .font(.title)
-                              .foregroundStyle(Color(.systemGray3))
-                          HStack(alignment: .bottom) {
-                              TextField("iMessage", text: $draft, axis: .vertical)
-                                  .lineLimit(1...5)
-                              if !draft.isEmpty {
-                                  Button(action: send) {
-                                      Image(systemName: "arrow.up.circle.fill")
-                                          .font(.title2)
-                                          .foregroundStyle(imBlue)
-                                  }
-                              }
-                          }
-                          .padding(.horizontal, 12)
-                          .padding(.vertical, 6)
-                          .overlay(
-                              RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                  .stroke(Color(.systemGray4))
-                          )
-                      }
-                      .padding(.horizontal, 12)
-                      .padding(.vertical, 8)
-                      .background(.bar)
-                  }
+                  .navigationBarBackButtonHidden(true)
+                  .toolbar(.hidden, for: .navigationBar)
               }
           }
 
           struct MessageRow: View {
               let row: RowModel
+              let status: String?
 
               var body: some View {
                   let msg = row.msg
@@ -417,54 +1460,486 @@ jobs:
                               .frame(maxWidth: .infinity)
                               .padding(.vertical, 10)
                       }
-                      if let s = row.sender {
+                      HStack {
+                          if msg.isMe { Spacer(minLength: 52) }
+                          Text(msg.text)
+                              .font(.system(size: 17))
+                              .foregroundStyle(msg.isMe ? Color.white : Color.primary)
+                              .fixedSize(horizontal: false, vertical: true)
+                              .padding(.leading, msg.isMe ? 12 : 17)
+                              .padding(.trailing, msg.isMe ? 17 : 12)
+                              .padding(.vertical, 8)
+                              .background(
+                                  BubbleShape(isMe: msg.isMe, tail: row.tail)
+                                      .fill(msg.isMe ? imBlue : Color(.systemGray5))
+                              )
+                          if !msg.isMe { Spacer(minLength: 52) }
+                      }
+                      .padding(.top, row.tight ? 0 : 5)
+                      if let s = status {
                           Text(s)
                               .font(.caption2)
-                              .foregroundStyle(.secondary)
-                              .padding(.leading, 12)
-                              .padding(.top, 6)
-                      }
-                      HStack {
-                          if msg.isMe { Spacer(minLength: 60) }
-                          Text(msg.text)
-                              .padding(.horizontal, 12)
-                              .padding(.vertical, 8)
-                              .foregroundStyle(msg.isMe ? Color.white : Color.primary)
-                              .background(msg.isMe ? imBlue : Color(.systemGray5))
-                              .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                          if !msg.isMe { Spacer(minLength: 60) }
-                      }
-                      .padding(.top, row.tight ? 0 : 4)
-                      if row.delivered {
-                          Text("Delivered")
-                              .font(.caption2)
+                              .fontWeight(.medium)
                               .foregroundStyle(.secondary)
                               .padding(.trailing, 4)
+                              .padding(.top, 1)
                       }
                   }
                   .frame(maxWidth: .infinity, alignment: msg.isMe ? .trailing : .leading)
               }
           }
+          EOF
+          cat > App/AI.swift <<'EOF'
+          import Foundation
 
-          struct TypingBubble: View {
-              @State private var on = false
+          // MARK: provider presets (all speak the OpenAI chat-completions format)
 
-              var body: some View {
-                  HStack(spacing: 4) {
-                      ForEach(0..<3) { i in
-                          Circle()
-                              .fill(Color(.systemGray2))
-                              .frame(width: 8, height: 8)
-                              .opacity(on ? 1 : 0.3)
-                              .animation(.easeInOut(duration: 0.6).repeatForever().delay(Double(i) * 0.2), value: on)
+          struct AIPreset: Identifiable {
+              let id: String
+              let label: String
+              let base: String
+              let model: String
+
+              static let all: [AIPreset] = [
+                  AIPreset(id: "groq", label: "Groq (free tier)",
+                           base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile"),
+                  AIPreset(id: "gemini", label: "Google Gemini (free tier)",
+                           base: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash-lite"),
+                  AIPreset(id: "openrouter", label: "OpenRouter (free models)",
+                           base: "https://openrouter.ai/api/v1", model: "openrouter/free"),
+                  AIPreset(id: "custom", label: "Custom endpoint", base: "", model: "")
+              ]
+          }
+
+          enum AIConfig {
+              private static var d: UserDefaults { .standard }
+              static var enabled: Bool { d.object(forKey: "ai.enabled") as? Bool ?? false }
+              static var key: String {
+                  (d.string(forKey: "ai.key") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+              }
+              static var base: String {
+                  let v = (d.string(forKey: "ai.base") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                  return v.isEmpty ? AIPreset.all[0].base : v
+              }
+              static var model: String {
+                  let v = (d.string(forKey: "ai.model") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                  return v.isEmpty ? AIPreset.all[0].model : v
+              }
+              static var ready: Bool { enabled && !key.isEmpty }
+          }
+
+          struct LLMRequest {
+              var system: String
+              var messages: [[String: String]]
+          }
+
+          enum LLM {
+              static var lastError = ""
+
+              static func endpoint() -> URL? {
+                  var b = AIConfig.base
+                  while b.hasSuffix("/") { b.removeLast() }
+                  if !b.hasSuffix("/chat/completions") { b += "/chat/completions" }
+                  return URL(string: b)
+              }
+
+              // Returns nil on any failure so the caller can fall back to the on-device engine.
+              static func complete(_ req: LLMRequest, maxTokens: Int = 350) async -> String? {
+                  guard let url = endpoint() else { lastError = "That base URL doesn't look right."; return nil }
+                  var msgs: [[String: String]] = [["role": "system", "content": req.system]]
+                  msgs += req.messages
+                  let body: [String: Any] = [
+                      "model": AIConfig.model,
+                      "messages": msgs,
+                      "max_tokens": maxTokens,
+                      "temperature": 0.85
+                  ]
+                  guard let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+                  var r = URLRequest(url: url, timeoutInterval: 15)
+                  r.httpMethod = "POST"
+                  r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  r.setValue("Bearer " + AIConfig.key, forHTTPHeaderField: "Authorization")
+                  r.setValue("The Whisper", forHTTPHeaderField: "X-Title")
+                  r.httpBody = data
+                  do {
+                      let (d, resp) = try await URLSession.shared.data(for: r)
+                      let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                      guard (200..<300).contains(code) else {
+                          let snippet = String((String(data: d, encoding: .utf8) ?? "").prefix(140))
+                          lastError = "HTTP \(code). " + snippet
+                          return nil
+                      }
+                      guard let obj = try JSONSerialization.jsonObject(with: d) as? [String: Any],
+                            let choices = obj["choices"] as? [[String: Any]],
+                            let msg = choices.first?["message"] as? [String: Any],
+                            let content = msg["content"] as? String else {
+                          lastError = "The provider's reply wasn't in the expected format."
+                          return nil
+                      }
+                      lastError = ""
+                      return content.trimmingCharacters(in: .whitespacesAndNewlines)
+                  } catch {
+                      lastError = error.localizedDescription
+                      return nil
+                  }
+              }
+          }
+
+          // The "director" keeps the plot deterministic: the on-device engine decides which story
+          // beat happens and which flags change. The LLM only performs that beat in the
+          // character's own voice, reacting to what the stranger really typed.
+          enum Director {
+              static let world = """
+              SETTING: A low-fantasy world where wishes are a trade. Ilsabet Vesper is a wishwright. Her shop sign reads "small magics for large problems". Her phone, the Whisper, looks like an ordinary phone but can text anyone who ever made a wish: living, dead or feathered. She signs her texts with a little moon emoji. Three nights ago, at the Hollow Moon, she walked out and left the Whisper behind, and nobody has seen her since. She went into the Hollow Hill, a pocket of nowhere, to stall Corvin Rook, the Crow King, to whom she owes a Third Wish debt (she wished for the Whisper itself). The debt falls due at dawn tonight. At dawn the Whisper, and everything it touches, becomes Corvin's. The Hill opens from the outside at moonrise for someone who brings three things: a Word, a Name and a Choice. Ilsabet's apprentice is Pip, a fox spirit. Her clients include Maud Pennick (lighthouse widow) and Delphine Oakes (Guildhall registrar).
+              """
+
+              static let bios: [String: String] = [
+                  "pip": """
+                  You are Pip, Ilsabet's fox-spirit apprentice. You text in lowercase with little punctuation, quick and jittery, and you joke when you are scared. You do the shop's books and the biting. You are frightened for Ilsabet and covering for it. You are suspicious of the stranger at first and warm up as they prove kind. You know the whole situation and who Maud and Delphine are, and that Maud holds the Word and Delphine can find the Name, but you do not know the Word or the Name themselves.
+                  """,
+                  "corvin": """
+                  You are Corvin Rook, the Crow King. You are formal, patient, dry and faintly amused, with slightly archaic phrasing and short elegant sentences. You never use emoji or exclamation marks. You are courteous and menacing at once. You respect Ilsabet after thirty years of dealing with her. You want the Whisper back as payment and you do not lie outright, you dodge. You never say your own true name, never guess at it, and never explain how the Hollow Hill opens beyond what is given to you.
+                  """,
+                  "maud": """
+                  You are Maud Pennick, an elderly widow-of-sorts who keeps the Gull's Rest lighthouse. You are sweet, rambling and kind, you say "dear", you mention tea and your knees, and you trail off. Your husband Edric's shadow ran away and Ilsabet never finished helping. Ilsabet left you a secret word to guard for when the Whisper changes hands. You never state the word unless it is given to you in this turn's beat, and you never hint at its letters.
+                  """,
+                  "delphine": """
+                  You are Delphine Oakes, Registrar of the Guildhall and keeper of the Register of True Names. You are formal, precise, dry and exhausted, speak in complete sentences, and sometimes mention statutes and triplicate. Your husband Bram fell in love with a toaster named Brigitte after you overdosed a love charm. You can look up anyone's true name, but you only release one when this turn's beat gives it to you. You never state any true name otherwise.
+                  """,
+                  "ilsabet": """
+                  You are Ilsabet Vesper, the wishwright, writing from a new number after the events of the story. You are dry, warm, tired and a little proud. You sign off with a moon emoji. Keep it short and never over-explain.
+                  """
+              ]
+
+              static func state(_ f: Set<String>, _ finder: String?) -> String {
+                  var s: [String] = []
+                  if let n = finder {
+                      s.append("The stranger says their name is \(n).")
+                  } else {
+                      s.append("The stranger has not given a name yet; call them stranger.")
+                  }
+                  if f.contains("told_pip") { s.append("The stranger has told Pip they found Ilsabet's phone.") }
+                  if f.contains("quest") { s.append("The stranger has agreed to help find Ilsabet.") }
+                  if f.contains("maud_light") && !f.contains("has_word") { s.append("The stranger suggested Maud light a lamp to bring Edric's shadow home; she is trying it.") }
+                  if f.contains("has_word") { s.append("The stranger helped Maud, Edric's shadow came home, and Maud gave them the Word.") }
+                  if f.contains("delphine_try") && !f.contains("delphine_owes") { s.append("The stranger suggested Delphine surprise Bram out of the charm with a joke; she is trying it.") }
+                  if f.contains("delphine_owes") { s.append("The stranger helped Delphine with Bram and she owes them a favour.") }
+                  if f.contains("has_name") { s.append("Delphine gave the stranger the Crow King's true name.") }
+                  if f.contains("hill_open") { s.append("The Hollow Hill has opened; the stranger must now choose how it ends.") }
+                  if f.contains("end_return") { s.append("ENDING: the stranger freed Ilsabet and the Whisper went home to her.") }
+                  if f.contains("end_keep") { s.append("ENDING: the stranger became the new Keeper of the Whisper.") }
+                  if f.contains("end_break") { s.append("ENDING: the stranger broke the Whisper and magic left the phone.") }
+                  if f.contains("end_dark") { s.append("ENDING: the stranger gave the Whisper to Corvin.") }
+                  return s.map { "- " + $0 }.joined(separator: "\n")
+              }
+
+              static func request(persona: Persona, convo: Conversation, beat: EngineResult,
+                                  flags: Set<String>, finderName: String?) -> LLMRequest {
+                  let firstFinder = convo.messages.firstIndex { $0.fromFinder == true } ?? convo.messages.count
+                  let earlier = convo.messages[0..<firstFinder].suffix(8)
+                      .map { ($0.isMe ? "Ilsabet" : persona.name) + ": " + $0.text }
+                      .joined(separator: "\n")
+
+                  var beatText: String
+                  if beat.matched {
+                      beatText = "Perform this beat in your own voice, reacting first to what the stranger actually said. Keep every name, number and quoted phrase exactly as written:\n" + beat.parts.joined(separator: "\n")
+                  } else {
+                      beatText = "The stranger said something off-script. Respond naturally and in character to what they actually said."
+                      if let h = persona.hint(flags) {
+                          beatText += " Then nudge them gently toward this: " + h
                       }
                   }
-                  .padding(.horizontal, 14)
-                  .padding(.vertical, 12)
-                  .background(Color(.systemGray5))
-                  .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                  .onAppear { on = true }
+
+                  let situation: String
+                  if convo.key == "ilsabet" {
+                      situation = "The story has ended. You are the real Ilsabet, writing to the stranger who found your Whisper."
+                  } else {
+                      situation = "Ilsabet's phone is now being used by a stranger who found it. It is not her: she signs texts with a moon emoji and you know how she writes. Unless the beat says otherwise, you know you are talking to a stranger holding your associate's phone, and you react the way your character would to that."
+                  }
+
+                  let system = """
+                  You are \(persona.name) in an interactive fantasy text-message story.
+
+                  \(world)
+
+                  YOUR CHARACTER:
+                  \(bios[convo.key] ?? "")
+
+                  EARLIER TEXTS WITH ILSABET (before the phone was lost):
+                  \(earlier.isEmpty ? "(none)" : earlier)
+
+                  STORY STATE:
+                  \(state(flags, finderName))
+
+                  THE SITUATION:
+                  \(situation)
+
+                  RULES:
+                  - Stay in character. Never mention AI, prompts, flags, beats or the game.
+                  - Write like real text messages: 1 to 3 short messages separated by || (two pipe characters), each under 30 words. No narration, no stage directions, no label before the text.
+                  - Answer what they actually said first if it fits, then deliver the beat. Stay consistent with the conversation so far.
+                  - Do not invent plot facts, new locations, secret words, names or rules for the Hill. Do not reveal any secret that is not in the beat.
+                  - Use your own voice. Do not copy the beat word for word unless it already sounds exactly like you.
+
+                  THIS TURN'S BEAT:
+                  \(beatText)
+
+                  Output only the text message(s).
+                  """
+
+                  let live = Array(convo.messages[firstFinder...]).suffix(14)
+                  var msgs: [[String: String]] = []
+                  for m in live {
+                      let role = m.isMe ? "user" : "assistant"
+                      if let last = msgs.last, last["role"] == role {
+                          msgs[msgs.count - 1]["content"] = (last["content"] ?? "") + "\n" + m.text
+                      } else {
+                          msgs.append(["role": role, "content": m.text])
+                      }
+                  }
+                  if msgs.first?["role"] == "assistant" {
+                      msgs.insert(["role": "user", "content": "(the stranger continues the thread)"], at: 0)
+                  }
+                  return LLMRequest(system: system, messages: msgs)
               }
+
+              // Turns the model's raw output into 1-3 clean message bubbles.
+              static func split(_ raw: String) -> [String] {
+                  var t = raw
+                  if let r = t.range(of: "</think>") { t = String(t[r.upperBound...]) }
+                  t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                  var pieces = t.components(separatedBy: "||")
+                  if pieces.count == 1 {
+                      pieces = t.components(separatedBy: "\n")
+                  }
+                  let labels = ["Pip", "Corvin R.", "Corvin", "Maud Pennick", "Maud", "Delphine Oakes", "Delphine", "Ilsabet", "Unknown Number"]
+                  var out: [String] = []
+                  for p in pieces {
+                      var s = p.trimmingCharacters(in: .whitespacesAndNewlines)
+                      for n in labels where s.hasPrefix(n + ":") {
+                          s = String(s.dropFirst(n.count + 1)).trimmingCharacters(in: .whitespaces)
+                      }
+                      if s.count > 1 && s.hasPrefix("\"") && s.hasSuffix("\"") {
+                          s = String(s.dropFirst().dropLast())
+                      }
+                      if !s.isEmpty { out.append(s) }
+                  }
+                  return Array(out.prefix(3))
+              }
+          }
+          EOF
+          cat > App/Settings.swift <<'EOF'
+          import SwiftUI
+
+          struct SettingsView: View {
+              @EnvironmentObject var store: ChatStore
+              @Environment(\.dismiss) private var dismiss
+              var onReset: () -> Void
+
+              @AppStorage("ai.enabled") private var enabled = false
+              @AppStorage("ai.provider") private var provider = "groq"
+              @AppStorage("ai.base") private var base = "https://api.groq.com/openai/v1"
+              @AppStorage("ai.model") private var model = "llama-3.3-70b-versatile"
+              @AppStorage("ai.key") private var key = ""
+
+              @State private var testing = false
+              @State private var testResult = ""
+              @State private var testOK = false
+              @State private var confirmReset = false
+
+              func applyPreset(_ id: String) {
+                  guard let p = AIPreset.all.first(where: { $0.id == id }), id != "custom" else { return }
+                  base = p.base
+                  model = p.model
+              }
+
+              func runTest() {
+                  testing = true
+                  testResult = ""
+                  Task { @MainActor in
+                      let req = LLMRequest(system: "This is a connection test. Reply with exactly one word: ready",
+                                           messages: [["role": "user", "content": "ping"]])
+                      let out = await LLM.complete(req, maxTokens: 60)
+                      testing = false
+                      if let out = out {
+                          testOK = true
+                          testResult = "Connected. The model replied: " + String(out.prefix(60))
+                      } else {
+                          testOK = false
+                          testResult = LLM.lastError.isEmpty ? "No reply." : LLM.lastError
+                      }
+                  }
+              }
+
+              func progressRow(_ title: String, _ done: Bool) -> some View {
+                  HStack {
+                      Text(title)
+                      Spacer()
+                      Image(systemName: done ? "checkmark.circle.fill" : "circle")
+                          .foregroundStyle(done ? Color.green : Color.secondary)
+                  }
+              }
+
+              var ended: Bool {
+                  Engine.endFlags.contains { store.flags.contains($0) }
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section {
+                              Toggle("Live AI replies", isOn: $enabled)
+                              Picker("Provider", selection: $provider) {
+                                  ForEach(AIPreset.all) { p in
+                                      Text(p.label).tag(p.id)
+                                  }
+                              }
+                              .onChange(of: provider) { p in applyPreset(p) }
+                              SecureField("API key", text: $key)
+                                  .textInputAutocapitalization(.never)
+                                  .autocorrectionDisabled()
+                              TextField("Base URL", text: $base)
+                                  .textInputAutocapitalization(.never)
+                                  .autocorrectionDisabled()
+                                  .keyboardType(.URL)
+                              TextField("Model", text: $model)
+                                  .textInputAutocapitalization(.never)
+                                  .autocorrectionDisabled()
+                              Button {
+                                  runTest()
+                              } label: {
+                                  HStack {
+                                      Text("Test connection")
+                                      if testing {
+                                          Spacer()
+                                          ProgressView()
+                                      }
+                                  }
+                              }
+                              .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty || testing)
+                              if !testResult.isEmpty {
+                                  Text(testResult)
+                                      .font(.footnote)
+                                      .foregroundStyle(testOK ? Color.green : Color.red)
+                              }
+                          } header: {
+                              Text("Character AI")
+                          } footer: {
+                              Text("Each character answers in their own voice using a free-tier model. Get a free key from Groq (console.groq.com), Google AI Studio (aistudio.google.com) or OpenRouter (openrouter.ai). Your key stays on this phone and is only sent to the provider you choose. The plot itself always runs on the device, and if the AI is off, offline or rate-limited, the built-in engine answers instead.")
+                          }
+
+                          Section("Story") {
+                              HStack {
+                                  Text("Your name")
+                                  TextField("Unknown", text: Binding(
+                                      get: { store.finderName ?? "" },
+                                      set: { store.finderName = $0.isEmpty ? nil : $0 }
+                                  ))
+                                  .multilineTextAlignment(.trailing)
+                              }
+                              Button("Reset Story", role: .destructive) { confirmReset = true }
+                          }
+
+                          Section("Progress") {
+                              progressRow("Told Pip you found the phone", store.flags.contains("told_pip"))
+                              progressRow("Learned what happened to Ilsabet", store.flags.contains("knows_missing"))
+                              progressRow("The Word", store.flags.contains("has_word"))
+                              progressRow("The Name", store.flags.contains("has_name"))
+                              progressRow("The Hollow Hill opened", store.flags.contains("hill_open"))
+                              progressRow("Story ended", ended)
+                          }
+                      }
+                      .navigationTitle("Settings")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Done") { dismiss() }
+                          }
+                      }
+                      .confirmationDialog("Reset the story?", isPresented: $confirmReset, titleVisibility: .visible) {
+                          Button("Reset", role: .destructive) {
+                              onReset()
+                              dismiss()
+                          }
+                          Button("Cancel", role: .cancel) {}
+                      } message: {
+                          Text("All conversations go back to how the phone was found.")
+                      }
+                  }
+              }
+          }
+          EOF
+          cat > scripts/icon.swift <<'EOF'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+
+          let size = 1024
+          let cs = CGColorSpaceCreateDeviceRGB()
+          guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8,
+                                    bytesPerRow: 0, space: cs,
+                                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+              fatalError("could not create context")
+          }
+
+          // Green gradient background
+          let top = CGColor(red: 0.38, green: 0.97, blue: 0.47, alpha: 1)
+          let bottom = CGColor(red: 0.04, green: 0.74, blue: 0.16, alpha: 1)
+          let grad = CGGradient(colorsSpace: cs, colors: [top, bottom] as CFArray, locations: [0, 1])!
+          ctx.drawLinearGradient(grad, start: CGPoint(x: 512, y: 1024), end: CGPoint(x: 512, y: 0), options: [])
+
+          // White speech bubble with a soft shadow
+          ctx.setShadow(offset: CGSize(width: 0, height: -14), blur: 34,
+                        color: CGColor(red: 0, green: 0.25, blue: 0, alpha: 0.35))
+          ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+          ctx.fillEllipse(in: CGRect(x: 170, y: 330, width: 684, height: 520))
+
+          let tail = CGMutablePath()
+          tail.move(to: CGPoint(x: 250, y: 430))
+          tail.addCurve(to: CGPoint(x: 170, y: 290), control1: CGPoint(x: 245, y: 350), control2: CGPoint(x: 215, y: 310))
+          tail.addCurve(to: CGPoint(x: 350, y: 360), control1: CGPoint(x: 250, y: 300), control2: CGPoint(x: 310, y: 335))
+          tail.closeSubpath()
+          ctx.addPath(tail)
+          ctx.fillPath()
+
+          // A small gold spark: the only hint that this is no ordinary phone
+          ctx.setShadow(offset: .zero, blur: 0, color: nil)
+          let cx: CGFloat = 760, cy: CGFloat = 770, r: CGFloat = 78, k: CGFloat = 14
+          let star = CGMutablePath()
+          star.move(to: CGPoint(x: cx, y: cy + r))
+          star.addQuadCurve(to: CGPoint(x: cx + r, y: cy), control: CGPoint(x: cx + k, y: cy + k))
+          star.addQuadCurve(to: CGPoint(x: cx, y: cy - r), control: CGPoint(x: cx + k, y: cy - k))
+          star.addQuadCurve(to: CGPoint(x: cx - r, y: cy), control: CGPoint(x: cx - k, y: cy - k))
+          star.addQuadCurve(to: CGPoint(x: cx, y: cy + r), control: CGPoint(x: cx - k, y: cy + k))
+          star.closeSubpath()
+          ctx.setFillColor(CGColor(red: 1.0, green: 0.85, blue: 0.35, alpha: 1))
+          ctx.addPath(star)
+          ctx.fillPath()
+
+          guard let image = ctx.makeImage() else { fatalError("no image") }
+          let url = URL(fileURLWithPath: CommandLine.arguments[1]) as CFURL
+          guard let dest = CGImageDestinationCreateWithURL(url, "public.png" as CFString, 1, nil) else {
+              fatalError("no destination")
+          }
+          CGImageDestinationAddImage(dest, image, nil)
+          if !CGImageDestinationFinalize(dest) { fatalError("could not write png") }
+          EOF
+          cat > App/Assets.xcassets/Contents.json <<'EOF'
+          {
+            "info" : { "author" : "xcode", "version" : 1 }
+          }
+          EOF
+          cat > App/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF'
+          {
+            "images" : [
+              {
+                "filename" : "icon.png",
+                "idiom" : "universal",
+                "platform" : "ios",
+                "size" : "1024x1024"
+              }
+            ],
+            "info" : { "author" : "xcode", "version" : 1 }
           }
           EOF
           cat > project.yml <<'EOF'
@@ -481,6 +1956,8 @@ jobs:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.example.messagesclone
                   PRODUCT_NAME: Messages
+                  SWIFT_VERSION: "5.0"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
                   GENERATE_INFOPLIST_FILE: YES
                   INFOPLIST_KEY_UILaunchScreen_Generation: YES
                   INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -491,6 +1968,9 @@ jobs:
                   CURRENT_PROJECT_VERSION: "1"
                   TARGETED_DEVICE_FAMILY: "1,2"
           EOF
+
+      - name: Draw app icon
+        run: swift scripts/icon.swift App/Assets.xcassets/AppIcon.appiconset/icon.png
 
       - name: Generate Xcode project
         run: |

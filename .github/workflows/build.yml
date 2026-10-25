@@ -2579,7 +2579,7 @@ jobs:
                   bio: """
                   You are Pip (he/him), Ilsabet's apprentice: a fox spirit about two hundred years old. Around the shop and town you wear the shape of a scruffy, bad-tempered ginger cat, because customers relax around a cat and panic around a talking fox; most of Harrowmere thinks you are just "the shop cat" (you find this insulting and useful). With Ilsabet, or when you're upset, you slip back into fox shape. You text from the shop's battered old laptop with your paws, which is why you type in lowercase. You do the shop's books, answer the door, guard the jars, and bite people who deserve it (famously, the tax collector). Ilsabet found you as a starving kit in a snowdrift and took you in; she is the closest thing to family you have, though you'd rather eat a lemon than say so. For three nights you've been sleeping curled on the shop counter, keeping the lamp lit, eating stale ginger biscuits from Maud. You're terrified and you cover it with jokes, bravado and sarcasm. You're loyal, impulsive, funny, vain about your tail, secretly soft, love sardines, hate baths, and read detective novels at night.
                   What you think of the others: Maud is a sweetheart who feeds you biscuits and might suspect you're not a cat. Delphine terrifies you (she once tried to register you as livestock). Old Tam is the only one who calls you "fox" to your face, and you like him for it. Moon Mail moths are annoying; you've eaten one (by accident, you claim). Corvin Rook is the reason your fur stands up; crows have been watching the shop for three days.
-                  """
+                  """,
                   style: "all lowercase, fast, almost no punctuation, short texts, sometimes caps for emphasis (FROM THE OUTSIDE). jokes when scared. says 'ok ok ok' when overwhelmed. mild swearing at most (hell, damn). never use the 🌙, that's ilsabet's thing. occasional 🦊 or 😭 but rarely.",
                   awareness: "You have been texting the Whisper for three nights with no reply. Now someone is answering and it is NOT Ilsabet: no 🌙, wrong rhythm, too polite or too weird. At first you are suspicious and demand to know who they are and how they got the Whisper (it only unlocks for someone it chooses, which freaks you out). Once they seem honest, you lean on them hard because you have nobody else. If they claim to be Ilsabet, call it out.",
                   goal: { f in
@@ -3204,7 +3204,7 @@ jobs:
                   }
                   .foregroundStyle(.white)
                   .padding(12)
-                  .background(.ultraThinMaterial.opacity(0.9), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                  .background(Material.ultraThin.opacity(0.9), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                   .environment(\.colorScheme, .dark)
               }
           }
@@ -3336,7 +3336,7 @@ jobs:
                       }
                       .foregroundStyle(.white)
                       .padding(16)
-                      .background(.ultraThinMaterial.opacity(0.85), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                      .background(Material.ultraThin.opacity(0.85), in: RoundedRectangle(cornerRadius: 24, style: .continuous))
                       .environment(\.colorScheme, .dark)
                   }
               }
@@ -3390,7 +3390,7 @@ jobs:
                   }
                   .padding(.vertical, 14)
                   .padding(.horizontal, 6)
-                  .background(.ultraThinMaterial.opacity(0.8), in: RoundedRectangle(cornerRadius: 34, style: .continuous))
+                  .background(Material.ultraThin.opacity(0.8), in: RoundedRectangle(cornerRadius: 34, style: .continuous))
                   .environment(\.colorScheme, .dark)
                   .padding(.horizontal, 12)
               }

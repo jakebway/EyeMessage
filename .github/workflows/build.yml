@@ -1113,8 +1113,16 @@ jobs:
               func send() {
                   let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !t.isEmpty else { return }
-                  draft = ""
+                  clearDraft()
                   store.send(t, to: id)
+              }
+
+              // The keyboard commits predictive text a beat after we clear the field, which can put
+              // the old text back on screen. Clearing again on the next run loops wins that race.
+              func clearDraft() {
+                  draft = ""
+                  DispatchQueue.main.async { draft = "" }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { draft = "" }
               }
 
               func status(_ c: Conversation, _ row: RowModel) -> String? {
@@ -1190,6 +1198,10 @@ jobs:
                               .padding(.leading, 16)
                               .submitLabel(.send)
                               .onSubmit(send)
+                              .onChange(of: draft) { v in
+                                  // Return on the keyboard sends, like iMessage's send key.
+                                  if v.hasSuffix("\n") { send() }
+                              }
                           ZStack {
                               if draft.trimmingCharacters(in: .whitespaces).isEmpty {
                                   Image(systemName: "mic.fill")
@@ -3738,8 +3750,9 @@ jobs:
                               .opacity(nav.locked ? 0 : 1)
                           if nav.app != .home {
                               appView
-                                  .background(Color(.systemBackground))
-                                  .clipShape(RoundedRectangle(cornerRadius: 52, style: .continuous))
+                                  .background(Color(.systemBackground), ignoresSafeAreaEdges: .all)
+                                  // Round the corners for the zoom without clipping anything under the status bar.
+                                  .mask(RoundedRectangle(cornerRadius: 52, style: .continuous).ignoresSafeArea())
                                   .transition(.scale(scale: 0.06, anchor: nav.anchor).combined(with: .opacity))
                                   .zIndex(1)
                           }

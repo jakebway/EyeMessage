@@ -43,6 +43,19 @@ jobs:
               static func trim(_ s: String?) -> String { (s ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
 
               static var enabled: Bool { d.object(forKey: "ai.enabled") as? Bool ?? false }
+              static var userDisabled: Bool { d.bool(forKey: "ai.userDisabled") }
+
+              // Runs on every launch: if a key is saved anywhere, make sure it's the active provider and
+              // that Live AI is on (unless the player deliberately switched it off).
+              static func autoFix() {
+                  migrate()
+                  if keyFor(provider).isEmpty, let p = AIPreset.all.map({ $0.id }).first(where: { !keyFor($0).isEmpty }) {
+                      d.set(p, forKey: "ai.provider")
+                  }
+                  if !keyFor(provider).isEmpty && !userDisabled && !enabled {
+                      d.set(true, forKey: "ai.enabled")
+                  }
+              }
               static var provider: String { d.string(forKey: "ai.provider") ?? "gemini" }
               static func preset(_ p: String) -> AIPreset { AIPreset.all.first { $0.id == p } ?? AIPreset.all[0] }
 
@@ -290,6 +303,32 @@ jobs:
                   return ids.first
               }
 
+              // MARK: connect on launch
+
+              static var connected: Bool? = nil
+              static var lastCheck: Date? = nil
+
+              // Checks the key without spending any reply quota (it just lists models), and quietly swaps
+              // in a working model if the saved one has been retired.
+              static func warmUp(force: Bool = false) async {
+                  AIConfig.autoFix()
+                  guard AIConfig.ready else { connected = nil; return }
+                  if !force, let last = lastCheck, Date().timeIntervalSince(last) < 600, connected == true { return }
+                  lastCheck = Date()
+                  let ids = await listModels()
+                  if ids.isEmpty {
+                      // A failed list doesn't always mean a bad key (some endpoints don't list); only flag real rejections.
+                      connected = (lastStatus == 401 || lastStatus == 403 || lastStatus == 400) ? false : nil
+                      return
+                  }
+                  connected = true
+                  lastError = ""
+                  let current = AIConfig.model
+                  if !ids.contains(current), let best = bestModel(from: ids) {
+                      AIConfig.setModel(best, for: AIConfig.provider)
+                  }
+              }
+
               // MARK: retries
 
               static let groqFallbacks = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
@@ -365,8 +404,34 @@ jobs:
                   return s.map { "- " + $0 }.joined(separator: "\n")
               }
 
+              // What the stranger and the other characters have said elsewhere on the phone. Shown only so
+              // nobody contradicts anybody; each character is told whether they could actually know it.
+              static func crossTalk(for key: String, others: [Conversation]) -> String {
+                  var blocks: [String] = []
+                  for c in others where c.key != key {
+                      let first = c.messages.firstIndex { $0.fromFinder == true || $0.live == true } ?? c.messages.count
+                      let live = Array(c.messages[first...].suffix(6))
+                      guard live.contains(where: { $0.isMe }) else { continue }
+                      let who = Roles.all[c.key]?.name ?? c.name
+                      let lines = live.map { ($0.isMe ? "Stranger" : who) + ": " + String($0.text.prefix(170)) }
+                      blocks.append("[" + who + "]\n" + lines.joined(separator: "\n"))
+                  }
+                  let all = blocks.joined(separator: "\n\n")
+                  return all.count > 2600 ? String(all.suffix(2600)) : all
+              }
+
+              static func crossHeader(_ key: String, _ flags: Set<String>) -> String {
+                  if key == "corvin" && !flags.contains("parcel_burned") {
+                      return "OTHER CONVERSATIONS ON THIS PHONE (your listening feather sits beside the phone, so you have overheard these and may use them, slyly)"
+                  }
+                  var h = "OTHER CONVERSATIONS ON THIS PHONE (for continuity only: you have NOT seen these. Never contradict shared facts in them, but only mention a detail if your character would plausibly know it: the stranger told you, or it's the kind of news that spreads in a small town)"
+                  if key == "corvin" { h += ". Your listening feather has been burned, so you can no longer overhear." }
+                  return h
+              }
+
               static func request(role: Role, convo: Conversation, flags: Set<String>, finderName: String?,
-                                  justHappened: [String]) -> LLMRequest {
+                                  justHappened: [String], others: [Conversation] = []) -> LLMRequest {
+                  let cross = crossTalk(for: role.key, others: others)
                   // Everything from the first text sent after the phone was found is the live conversation.
                   let firstFinder = convo.messages.firstIndex { $0.fromFinder == true || $0.live == true } ?? convo.messages.count
                   let earlier = convo.messages[0..<firstFinder].suffix(10)
@@ -403,6 +468,9 @@ jobs:
                   PEOPLE AND PLACES (what a local would know)
                   \(Roles.people)
 
+                  CANON (fixed facts: never contradict these)
+                  \(Roles.canon)
+
                   WHO YOU ARE
                   \(role.bio)
 
@@ -418,6 +486,9 @@ jobs:
                   STORY SO FAR (background for you; your character only knows the parts that involve them, or that would plausibly have reached them by gossip, crows or the phone. Never mention things you couldn't know.)
                   \(state(flags, finderName))
                   \(happened)
+                  \(crossHeader(role.key, flags))
+                  \(cross.isEmpty ? "(none yet)" : cross)
+
                   YOUR PART RIGHT NOW
                   \(role.goal(flags))
 
@@ -1050,6 +1121,292 @@ jobs:
               { "filename" : "eye.png", "idiom" : "universal" }
             ],
             "info" : { "author" : "xcode", "version" : 1 }
+          }
+          EOF
+          cat > App/Browser.swift <<'EOF'
+          import SwiftUI
+
+          struct WebPage: Identifiable {
+              let id: String
+              let site: String
+              let title: String
+              let byline: String
+              let paragraphs: [String]
+              var links: [String] = []
+          }
+
+          enum Web {
+              static let pages: [WebPage] = [
+                  WebPage(id: "crows", site: "harrowmeregazette.co", title: "Crows Gather Over Crooked Gate for Third Night",
+                          byline: "Harrowmere Gazette · Local · Today",
+                          paragraphs: [
+                              "Residents of Crooked Gate have reported hundreds of crows roosting along the rooftops for a third straight night, with the largest gathering on the gutters of Vesper's Remedies at number 9.",
+                              "The shop, run by the town's witch, Ilsabet Vesper, has been closed for three days. Its door appears to be locked from the outside. Ms Vesper could not be reached for comment.",
+                              "\"They're all facing inland,\" said Maud Pennick, 78, keeper of the Gull's Rest lighthouse. \"The gulls too. I don't like it one bit.\"",
+                              "Registrar Delphine Oakes declined to comment \"on matters outside the Register.\" Old Tam of Blackfell Moor forecast \"crows, then more crows.\"",
+                              "A black cat was seen at the shop window hissing at the birds. The Gazette was unable to confirm reports that it hissed back in words."
+                          ]),
+                  WebPage(id: "names", site: "folk.harrowmere.org", title: "True Names and the Fair Folk",
+                          byline: "Harrowmere Folklore Society · Archive",
+                          paragraphs: [
+                              "The fair folk of Blackfell are said to keep their true names as close as their shadows. The name they go by among mortals is a coat, not a skin.",
+                              "A bargain struck with one of them can be broken by naming them truly. Every tale agrees the name must be spoken by the one who owes, in their own voice. Tales differ on whether a letter, a message or a song carried in that voice counts. Most say it does.",
+                              "A bargain that has been called in is not sealed at once. Old wives on the moor say it binds \"at the third dawn\", and until then the debtor's voice may still undo it.",
+                              "Wrong guesses are said to amuse them greatly. Do not guess near crows.",
+                              "The oldest lullabies of the north point are thought to preserve names that were otherwise lost. Ask your grandmother. Ask her twice."
+                          ]),
+                  WebPage(id: "search", site: "search", title: "how to guess a fae king's real name",
+                          byline: "About 1,300 results",
+                          paragraphs: [
+                              "True Names and the Fair Folk · folk.harrowmere.org\n\"...must be spoken by the one who owes, in their own voice...\"",
+                              "Harrowmere Town Forum · \"my neighbour guessed 'Steve'\"\n\"...he did not, it turns out, like that.\"",
+                              "Guildhall Register: Search Names · guildhall.harrowmere.gov\n\"Staff access only. Requests for true names are refused under Statute 12.\"",
+                              "Ask a Witch · \"Cat came back... different?\"\n\"...depends who did the recovering, lass.\""
+                          ],
+                          links: ["names", "", "", "forum"]),
+                  WebPage(id: "forum", site: "askawitch.forum", title: "Cat came back... different?",
+                          byline: "posted by moonsign · 1 year ago · 2 replies",
+                          paragraphs: [
+                              "moonsign: My cat had an accident last winter. He's fine now. Better than fine, honestly. He talks more. He's ruder. He doesn't remember the accident at all, and I'd like to keep it that way. Is that normal after... a recovery? Asking for a friend. 🌙",
+                              "hedgewife_43: Depends what kind of recovery. If it was a poultice, yes. If it was anything else, you already know.",
+                              "TamOnTheMoor: Depends who did the recovering, lass. And what they asked for."
+                          ]),
+                  WebPage(id: "toaster", site: "morrowanddaughters.co", title: "4-Slice Toaster: Care & Use",
+                          byline: "Morrow & Daughters · Support",
+                          paragraphs: [
+                              "Thank you for choosing a Morrow & Daughters toaster. With care, it will last a lifetime.",
+                              "Do not immerse in water. Do not use near open enchantments.",
+                              "If your toaster becomes the object of affection, unplug it, remove any hats, and consult a registered witch. Morrow & Daughters accepts no responsibility for proposals."
+                          ]),
+                  WebPage(id: "moor", site: "walkblackfell.co", title: "Blackfell Moor: Walking Routes",
+                          byline: "Walk Blackfell · Routes",
+                          paragraphs: [
+                              "The Western Path (4 miles) climbs from the end of Crooked Gate past Old Tam's hut. Weather on request; pay the man.",
+                              "Halfway along you'll pass the Hollow Hill, a grassy mound bigger on the inside than out. Do not knock. Do not sit on it. Do not accept lifts from coaches after midnight.",
+                              "Crows are common on the moor. Avoid eye contact."
+                          ])
+              ]
+
+              static func page(_ id: String) -> WebPage? { pages.first { $0.id == id } }
+
+              static let history: [(String, String, String)] = [
+                  ("forum", "Cat came back... different?", "3 nights ago, 10:58 PM"),
+                  ("names", "True Names and the Fair Folk", "3 nights ago, 10:41 PM"),
+                  ("search", "how to guess a fae king's real name", "3 nights ago, 10:39 PM"),
+                  ("moor", "Blackfell Moor: Walking Routes", "4 days ago"),
+                  ("toaster", "4-Slice Toaster: Care & Use", "6 days ago")
+              ]
+          }
+
+          struct SafariApp: View {
+              @EnvironmentObject var store: ChatStore
+              @AppStorage("safari.tab") private var current = "crows"
+              @State private var showTabs = false
+              @State private var showHistory = false
+              @State private var back: [String] = []
+
+              let tabs = ["crows", "names", "forum", "moor"]
+
+              func open(_ id: String) {
+                  guard Web.page(id) != nil else { return }
+                  if id != current { back.append(current) }
+                  withAnimation(.easeInOut(duration: 0.2)) { current = id }
+                  if id == "forum" { store.secret("forum") }
+              }
+
+              func pageView(_ p: WebPage) -> some View {
+                  ScrollView {
+                      VStack(alignment: .leading, spacing: 14) {
+                          Text(p.site.uppercased()).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                          Text(p.title).font(.system(size: 30, weight: .bold, design: .serif))
+                          Text(p.byline).font(.system(size: 14)).foregroundStyle(.secondary)
+                          Divider()
+                          ForEach(Array(p.paragraphs.enumerated()), id: \.offset) { i, para in
+                              if p.id == "search" {
+                                  Button {
+                                      if i < p.links.count, !p.links[i].isEmpty { open(p.links[i]) }
+                                  } label: {
+                                      Text(para).font(.system(size: 16)).foregroundStyle(imBlue).multilineTextAlignment(.leading)
+                                          .frame(maxWidth: .infinity, alignment: .leading)
+                                  }
+                                  .buttonStyle(.plain)
+                                  Divider()
+                              } else {
+                                  Text(para).font(.system(size: 18, design: .serif)).lineSpacing(5)
+                              }
+                          }
+                          Color.clear.frame(height: 90)
+                      }
+                      .padding(.horizontal, 20)
+                      .padding(.top, 12)
+                  }
+              }
+
+              var bottomBar: some View {
+                  HStack(spacing: 10) {
+                      Button {
+                          if let last = back.popLast() { withAnimation { current = last } }
+                      } label: {
+                          Image(systemName: "chevron.left").font(.system(size: 18, weight: .semibold))
+                              .frame(width: 44, height: 44).glass(Circle())
+                      }
+                      .disabled(back.isEmpty)
+                      Button { showHistory = true } label: {
+                          HStack(spacing: 6) {
+                              Image(systemName: "lock.fill").font(.system(size: 11))
+                              Text(Web.page(current)?.site ?? "").font(.system(size: 15, weight: .medium)).lineLimit(1)
+                          }
+                          .foregroundStyle(.primary)
+                          .frame(maxWidth: .infinity)
+                          .frame(height: 44)
+                          .glass(Capsule())
+                      }
+                      Button { showTabs = true } label: {
+                          Image(systemName: "square.on.square").font(.system(size: 17, weight: .semibold))
+                              .frame(width: 44, height: 44).glass(Circle())
+                      }
+                  }
+                  .foregroundStyle(.primary)
+                  .padding(.horizontal, 14)
+                  .padding(.bottom, 30)
+              }
+
+              var tabsView: some View {
+                  NavigationStack {
+                      ScrollView {
+                          LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)], spacing: 18) {
+                              ForEach(tabs, id: \.self) { id in
+                                  if let p = Web.page(id) {
+                                      Button {
+                                          open(id)
+                                          showTabs = false
+                                      } label: {
+                                          VStack(alignment: .leading, spacing: 6) {
+                                              Text(p.title).font(.system(size: 13, weight: .bold, design: .serif)).foregroundStyle(.primary).lineLimit(3)
+                                              Text(p.paragraphs.first ?? "").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(6)
+                                              Spacer(minLength: 0)
+                                          }
+                                          .padding(12)
+                                          .frame(height: 190)
+                                          .frame(maxWidth: .infinity, alignment: .topLeading)
+                                          .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
+                                          .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                              .stroke(id == current ? imBlue : Color.clear, lineWidth: 3))
+                                      }
+                                      .buttonStyle(PressableStyle())
+                                  }
+                              }
+                          }
+                          .padding(16)
+                      }
+                      .navigationTitle("\(tabs.count) Tabs")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showTabs = false } } }
+                  }
+              }
+
+              var historyView: some View {
+                  NavigationStack {
+                      List {
+                          Section("History") {
+                              ForEach(Web.history, id: \.0) { item in
+                                  Button {
+                                      open(item.0)
+                                      showHistory = false
+                                  } label: {
+                                      VStack(alignment: .leading, spacing: 2) {
+                                          Text(item.1).foregroundStyle(.primary)
+                                          Text(item.2).font(.system(size: 13)).foregroundStyle(.secondary)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("Search or enter website")
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showHistory = false } } }
+                  }
+              }
+
+              var body: some View {
+                  ZStack(alignment: .bottom) {
+                      if let p = Web.page(current) {
+                          pageView(p).id(p.id).transition(.opacity)
+                      }
+                      bottomBar
+                  }
+                  .background(Color(.systemBackground))
+                  .ignoresSafeArea(edges: .bottom)
+                  .sheet(isPresented: $showTabs) { tabsView }
+                  .sheet(isPresented: $showHistory) { historyView.presentationDetents([.medium, .large]) }
+                  .onAppear { if current == "forum" { store.secret("forum") } }
+              }
+          }
+
+          struct ReminderItem: Identifiable {
+              let id: String
+              let title: String
+              let note: String
+              let due: String
+              var overdue = false
+              var flagged = false
+          }
+
+          struct RemindersApp: View {
+              @AppStorage("reminders.done") private var done = "plants"
+
+              let items: [ReminderItem] = [
+                  ReminderItem(id: "name", title: "GUESS HIS NAME", note: "A year and a day. Not Steve.", due: "4 days ago", overdue: true, flagged: true),
+                  ReminderItem(id: "song", title: "Song for Tam", note: "He means it", due: "Tuesday", overdue: true),
+                  ReminderItem(id: "feed", title: "Feed Pip", note: "He will say he's been fed. He hasn't.", due: "Daily"),
+                  ReminderItem(id: "pie", title: "Return Maud's pie dish", note: "The blue one", due: "Last week", overdue: true),
+                  ReminderItem(id: "edric", title: "Tell Maud about the lamp", note: "Just TELL her", due: "2 weeks ago", overdue: true),
+                  ReminderItem(id: "toaster", title: "Delphine: toaster", note: "Do not touch the toaster", due: "Friday", overdue: true),
+                  ReminderItem(id: "candles", title: "Candles x12", note: "", due: ""),
+                  ReminderItem(id: "plants", title: "Water the plants", note: "RIP", due: "")
+              ]
+
+              func isDone(_ id: String) -> Bool { done.components(separatedBy: ",").contains(id) }
+
+              func toggle(_ id: String) {
+                  var set = Set(done.components(separatedBy: ",").filter { !$0.isEmpty })
+                  if set.contains(id) { set.remove(id) } else { set.insert(id) }
+                  withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { done = set.sorted().joined(separator: ",") }
+                  UIImpactFeedbackGenerator(style: .light).impactOccurred()
+              }
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          ForEach(items) { r in
+                              HStack(alignment: .top, spacing: 12) {
+                                  Button { toggle(r.id) } label: {
+                                      Image(systemName: isDone(r.id) ? "largecircle.fill.circle" : "circle")
+                                          .font(.system(size: 22))
+                                          .foregroundStyle(isDone(r.id) ? Color.orange : Color.secondary)
+                                  }
+                                  .buttonStyle(.plain)
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      HStack {
+                                          Text(r.title).foregroundStyle(isDone(r.id) ? Color.secondary : Color.primary)
+                                          Spacer()
+                                          if r.flagged { Image(systemName: "flag.fill").foregroundStyle(.orange).font(.system(size: 13)) }
+                                      }
+                                      if !r.note.isEmpty { Text(r.note).font(.system(size: 14)).foregroundStyle(.secondary) }
+                                      if !r.due.isEmpty {
+                                          Text(r.due).font(.system(size: 14))
+                                              .foregroundStyle(r.overdue && !isDone(r.id) ? Color.red : Color.secondary)
+                                      }
+                                  }
+                              }
+                              .padding(.vertical, 4)
+                          }
+                      }
+                      .listStyle(.plain)
+                      .navigationTitle("Reminders")
+                  }
+                  .tint(.orange)
+              }
           }
           EOF
           cat > App/ChatView.swift <<'EOF'
@@ -2100,7 +2457,7 @@ jobs:
               I'd do it again. Every time.
 
               Pip doesn't remember. Pip must never know.
-              """, date: at(daysAgo: 368, hour: 3, minute: 10))
+              """, date: at(daysAgo: 369, hour: 3, minute: 10))
 
               static func voicemails(_ f: Set<String>) -> [Voicemail] {
                   var v: [Voicemail] = [
@@ -2644,6 +3001,7 @@ jobs:
               @Published var banner: Banner? = nil
               @Published var aiNote: String = ""
               @Published var toast: String? = nil
+              @Published var aiConnected: Bool? = nil
               var openChat: UUID? = nil
               private var epoch = 0
               private var pending: [UUID: UUID] = [:]
@@ -2658,7 +3016,7 @@ jobs:
               }
 
               init() {
-                  AIConfig.migrate()
+                  AIConfig.autoFix()
                   if let data = UserDefaults.standard.data(forKey: saveKey),
                      let snap = try? JSONDecoder().decode(Snapshot.self, from: data) {
                       conversations = snap.conversations
@@ -2668,6 +3026,15 @@ jobs:
                       conversations = Story.initialConversations()
                   }
                   checkTriggers()
+                  connectAI()
+              }
+
+              func connectAI(force: Bool = false) {
+                  Task { @MainActor in
+                      await LLM.warmUp(force: force)
+                      self.aiConnected = LLM.connected
+                      if LLM.connected == false { self.aiNote = LLM.lastError } else if LLM.connected == true { self.aiNote = "" }
+                  }
               }
 
               private func save() {
@@ -2736,7 +3103,7 @@ jobs:
 
               static func typeTime(_ s: String) -> Double {
                   let fast = UserDefaults.standard.bool(forKey: "fastReplies")
-                  return min(0.7 + Double(s.count) * 0.028, 2.8) * (fast ? 0.4 : 1)
+                  return min(1.1 + Double(s.count) * 0.045, 4.6) * (fast ? 0.4 : 1)
               }
 
               static func sleep(_ seconds: Double) async {
@@ -2758,19 +3125,50 @@ jobs:
                   Sound.sent()
                   if let n = Engine.detectName(text) { finderName = n }
 
+                  // Under the hill there's no signal: texts to her just fail, like a phone out of service.
+                  if conversations[i].key == "ilsabet" && !isEnded {
+                      failNoService(cid, after: 2.6)
+                      return
+                  }
+
                   // Wait briefly so a burst of texts gets one reply, like a person would.
                   let token = UUID()
                   pending[cid] = token
                   let ep = epoch
                   Task { @MainActor in
-                      await ChatStore.sleep(1.4)
+                      await ChatStore.sleep(1.8)
                       guard self.epoch == ep, self.pending[cid] == token else { return }
                       await self.reply(to: cid, epoch: ep)
                   }
               }
 
+              private func failNoService(_ cid: UUID, after delay: Double) {
+                  let ep = epoch
+                  Task { @MainActor in
+                      await ChatStore.sleep(delay)
+                      guard self.epoch == ep, let j = self.idx(cid) else { return }
+                      withAnimation(.easeInOut(duration: 0.25)) {
+                          var k = self.conversations[j].messages.count - 1
+                          while k >= 0 && self.conversations[j].messages[k].isMe {
+                              self.conversations[j].messages[k].failed = true
+                              k -= 1
+                          }
+                      }
+                      UINotificationFeedbackGenerator().notificationOccurred(.error)
+                  }
+              }
+
               func retry(_ cid: UUID) {
                   guard let i = idx(cid) else { return }
+                  if conversations[i].key == "ilsabet" && !isEnded {
+                      withAnimation(.easeInOut(duration: 0.2)) {
+                          for k in conversations[i].messages.indices where conversations[i].messages[k].failed == true {
+                              conversations[i].messages[k].failed = nil
+                          }
+                      }
+                      failNoService(cid, after: 3.2)
+                      return
+                  }
                   withAnimation(.easeInOut(duration: 0.2)) {
                       for k in conversations[i].messages.indices where conversations[i].messages[k].failed == true {
                           conversations[i].messages[k].failed = nil
@@ -2797,7 +3195,7 @@ jobs:
 
               // MARK: secrets
 
-              static let secretIDs = ["deleted", "locked", "333", "version", "spotlight", "voicemail", "crows"]
+              static let secretIDs = ["deleted", "locked", "333", "version", "spotlight", "voicemail", "crows", "forum"]
               var secretCount: Int { ChatStore.secretIDs.filter { flags.contains("secret_" + $0) }.count }
 
               func secret(_ id: String) {
@@ -2826,8 +3224,8 @@ jobs:
                   let joined = recent.joined(separator: "\n")
                   if joined.isEmpty { return }
 
-                  // They have read it.
-                  await ChatStore.sleep(0.4)
+                  // They pick the phone up and read it, like a person would.
+                  await ChatStore.sleep(Double.random(in: 0.9...2.4))
                   guard epoch == ep, let i2 = idx(cid) else { return }
                   withAnimation(.easeInOut(duration: 0.2)) { conversations[i2].seenAt = Date() }
 
@@ -2845,8 +3243,14 @@ jobs:
                       withAnimation(ChatStore.bubbleSpring) { _ = typing.insert(cid) }
                       guard let i3 = idx(cid) else { return }
                       let req = Director.request(role: role, convo: conversations[i3], flags: flags,
-                                                 finderName: finderName, justHappened: justHappened)
-                      let raw = await LLM.completeWithRetry(req)
+                                                 finderName: finderName, justHappened: justHappened,
+                                                 others: conversations)
+                      // Ask the model straight away, but let them "think" for a moment before typing shows.
+                      withAnimation(ChatStore.bubbleSpring) { _ = typing.remove(cid) }
+                      async let pendingReply = LLM.completeWithRetry(req)
+                      await ChatStore.sleep(Double.random(in: 0.8...2.2))
+                      if epoch == ep { withAnimation(ChatStore.bubbleSpring) { _ = typing.insert(cid) } }
+                      let raw = await pendingReply
                       guard epoch == ep else { return }
                       if let raw = raw {
                           let parsed = Director.parse(raw)
@@ -2929,11 +3333,21 @@ jobs:
                       if !typing.contains(cid) {
                           withAnimation(ChatStore.bubbleSpring) { _ = typing.insert(cid) }
                       }
-                      let t = (n == 0 && warm) ? min(ChatStore.typeTime(part) * 0.45, 1.3) : ChatStore.typeTime(part)
-                      await ChatStore.sleep(t)
+                      let t = (n == 0 && warm) ? min(ChatStore.typeTime(part) * 0.6, 2.4) : ChatStore.typeTime(part)
+                      if t > 2.0 && Double.random(in: 0...1) < 0.35 {
+                          // People stop and start typing; so does the indicator.
+                          await ChatStore.sleep(t * 0.5)
+                          withAnimation(.easeOut(duration: 0.2)) { _ = typing.remove(cid) }
+                          await ChatStore.sleep(Double.random(in: 0.7...1.4))
+                          guard epoch == ep else { return }
+                          withAnimation(ChatStore.bubbleSpring) { _ = typing.insert(cid) }
+                          await ChatStore.sleep(t * 0.5)
+                      } else {
+                          await ChatStore.sleep(t)
+                      }
                       guard epoch == ep else { return }
                       appendIncoming(part, to: cid)
-                      await ChatStore.sleep(0.45)
+                      await ChatStore.sleep(Double.random(in: 0.6...1.2))
                   }
               }
 
@@ -3065,6 +3479,20 @@ jobs:
               - Places: Vesper's Remedies on Crooked Gate; the Drowned Lamb pub; the Gull's Stair down to the river; the Guildhall; Blackfell Moor; the Hollow Hill, a grassy mound with a door that only fae can see.
               """
 
+              // Fixed public facts every character shares, so the story can't drift between chats.
+              // (The secrets — the true name, and why she made the bargain — are deliberately not here.)
+              static let canon = """
+              - Three nights ago was the Hollow Moon. At about 11:30 PM Ilsabet put on her coat, told Pip "don't wait up", left her phone on the shop counter and walked out. She never came back. The shop door locked itself from the outside.
+              - Around midnight that night Old Tam saw a coach made of crows go up the moor road and into the Hollow Hill, and heard Ilsabet swearing inside it.
+              - The next night Corvin Rook let himself into the locked shop, left a black feather on her chair, and smiled at Pip, who hid in the flour sack.
+              - Two nights ago Moon Mail delivered a parcel from C. Rook containing a second black feather. It was left with the cat. It's still warm. (Pip has been sleeping on it.)
+              - Crows have gathered over Crooked Gate for three days. The Harrowmere Gazette ran a story about it.
+              - The bargain binds at the third dawn: tonight, 6:14 AM. Moonrise tonight is 11:52 PM.
+              - The shop is Vesper's Remedies, 9 Crooked Gate. Ilsabet and Pip live upstairs. Maud lives at the Gull's Rest lighthouse on the north point. Delphine and Bram live on Ledger Row. Old Tam has a stone hut on Blackfell Moor, a mile from the Hollow Hill. The Bank of Ash is on Cinder Lane; Moon Mail's sorting loft is above it.
+              - Bram's love-charmed toaster is called Brigitte and wears a small hat. Edric Pennick died two winters ago; his shadow stayed.
+              - Ilsabet signs her texts with a 🌙. Anything typed on her phone counts as her own voice.
+              """
+
               static let endingText: [String: String] = [
                   "end_free": "The story has ended: the stranger said the Crow King's true name to him through Ilsabet's phone. The bargain broke. Ilsabet walked out of the Hollow Hill and is home.",
                   "end_dark": "The story has ended badly: the stranger gave Corvin the phone in exchange for a promise. Fae promises are tricky; Ilsabet did not come home, and Corvin now has a phone that can reach anyone."
@@ -3159,6 +3587,7 @@ jobs:
                       var k = [
                           "Three nights ago, on the Hollow Moon, Ilsabet said 'don't wait up', walked out without her phone, and never came back. The shop door locked itself from the outside.",
                           "The next night Corvin Rook, the Crow King, let himself in, left a black feather on her chair and smiled at you. You hid in the flour sack.",
+                          "Moon Mail left a parcel from C. Rook with you: another feather. It's warm, so you've been sleeping on it. (If someone says it's a listening feather, you're horrified: you've been talking to yourself next to it for two nights.)",
                           "You're sure Corvin took her under the Hollow Hill. Every story says a fae must let go if you say their true name to them. You don't know his.",
                           "Ilsabet once muttered that 'anything typed on this phone is as good as my own voice'.",
                           "Clients keep texting her phone: Maud Pennick (lighthouse; her late husband Edric's shadow keeps wandering off), Delphine Oakes (Guildhall Registrar; love charm went wrong, her husband is in love with the toaster), Old Tam (weather witch), Moon Mail and the Bank of Ash.",
@@ -3416,6 +3845,7 @@ jobs:
                   } else {
                       AIConfig.setKey(clean, for: provider)
                   }
+                  if !clean.isEmpty { store.connectAI(force: true) }
               }
 
               func runTest() {
@@ -3464,11 +3894,12 @@ jobs:
               var statusLine: some View {
                   HStack(spacing: 8) {
                       Circle()
-                          .fill(!enabled ? Color.gray : (hasKey ? (store.aiNote.isEmpty ? Color.green : Color.orange) : Color.red))
+                          .fill(!enabled ? Color.gray : (hasKey && store.aiConnected != false ? (store.aiNote.isEmpty ? Color.green : Color.orange) : Color.red))
                           .frame(width: 9, height: 9)
                       Text(!enabled ? "Off: characters use the offline engine" :
                               (!hasKey ? "Needs an API key" :
-                                  (store.aiNote.isEmpty ? "On: " + AIConfig.preset(provider).label + " · " + modelText : "On, but the last reply failed")))
+                                  (store.aiConnected == false ? "Key rejected: check it" :
+                                      (store.aiNote.isEmpty ? (store.aiConnected == true ? "Connected: " : "On: ") + AIConfig.preset(provider).label + " · " + AIConfig.model : "On, but the last reply failed"))))
                           .font(.system(size: 15))
                           .foregroundStyle(.secondary)
                   }
@@ -3477,6 +3908,10 @@ jobs:
               var aiSection: some View {
                   Section {
                       Toggle("Live AI characters", isOn: $enabled)
+                          .onChange(of: enabled) { on in
+                              UserDefaults.standard.set(!on, forKey: "ai.userDisabled")
+                              if on { store.connectAI(force: true) }
+                          }
                       statusLine
                       Picker("Provider", selection: $provider) {
                           ForEach(AIPreset.all) { p in Text(p.label).tag(p.id) }
@@ -3544,7 +3979,7 @@ jobs:
                   } header: {
                       Text("Characters")
                   } footer: {
-                      Text("Paste a key and tap Test connection; a working test turns Live AI on. Recommended: a free Google Gemini key (model gemini-flash-latest). Each provider remembers its own key, and a pasted key switches to the right provider by itself. Keys stay on this phone. With Live AI off, a simpler offline engine plays the characters.")
+                      Text("Paste a key once: it's saved on this phone and connects automatically every time you open the app. Recommended: a free Google Gemini key (model gemini-flash-latest). Each provider remembers its own key, and a pasted key switches to the right provider by itself. Keys stay on this phone. With Live AI off, a simpler offline engine plays the characters.")
                   }
                   .onAppear(perform: load)
               }
@@ -3660,7 +4095,7 @@ jobs:
           import AVFoundation
 
           enum AppID: String {
-              case home, messages, phone, notes, calendar, weather, settings, clock, contacts
+              case home, messages, phone, notes, calendar, weather, settings, clock, contacts, safari, reminders
           }
 
           @MainActor
@@ -3735,6 +4170,8 @@ jobs:
                   case .settings: SettingsApp()
                   case .clock: ClockApp()
                   case .contacts: ContactsApp()
+                  case .safari: SafariApp()
+                  case .reminders: RemindersApp()
                   case .home: EmptyView()
                   }
               }
@@ -3828,6 +4265,7 @@ jobs:
                   .preferredColorScheme(onSpringboard ? .dark : systemScheme)
                   .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                       systemScheme = PhoneRoot.currentSystemScheme()
+                      store.connectAI()
                   }
                   .persistentSystemOverlays(.hidden)
                   .defersSystemGestures(on: .bottom)
@@ -4566,6 +5004,15 @@ jobs:
                                   iconBlock(m)
                               }
                               .padding(.top, 30)
+                              LazyVGrid(columns: Array(repeating: GridItem(.fixed(m.icon), spacing: (m.medium - m.icon * 4) / 3), count: 4),
+                                        alignment: .leading, spacing: 20) {
+                                  HomeIcon(app: .safari, title: "Safari", symbol: "safari.fill",
+                                           colors: [Color.white, Color(hex: 0xE6EEF8)], fg: Color(hex: 0x1E7CF2), size: m.icon)
+                                  HomeIcon(app: .reminders, title: "Reminders", symbol: "checklist",
+                                           colors: [Color.white, Color(hex: 0xECECEC)], fg: Color(hex: 0xFF9500), size: m.icon)
+                              }
+                              .frame(width: m.medium, alignment: .leading)
+                              .padding(.top, 22)
                               Spacer()
                               searchPill.padding(.bottom, 16)
                               dock(m).padding(.bottom, 14)
@@ -4984,6 +5431,16 @@ jobs:
                   ]),
                   Trigger(id: "ilsabet_hill", when: ["told_pip"], any: ["knows_missing", "bank_verified", "maud_light", "delphine_try", "quest"], unless: ["end_free", "end_dark"], pings: [
                       Ping(to: "ilsabet", text: "is someone holding my phone||it's all doors down here. this took an hour to send||don't give him the phone 🌙", delay: 30)
+                  ]),
+                  // She only gets a bar of signal now and then; these are the moments that get through.
+                  Trigger(id: "ilsabet_pip", when: ["quest"], unless: ["end_free", "end_dark"], pings: [
+                      Ping(to: "ilsabet", text: "is pip eating||tin opener's in the blue jar. he can't work it. he'll pretend he can 🌙", delay: 95)
+                  ]),
+                  Trigger(id: "ilsabet_name", when: ["has_name"], unless: ["end_free", "end_dark"], pings: [
+                      Ping(to: "ilsabet", text: "the whole hill just shivered||someone said something near a crow they shouldn't have||was that you. keep going 🌙", delay: 45)
+                  ]),
+                  Trigger(id: "ilsabet_bank", when: ["bank_verified"], unless: ["end_free", "end_dark"], pings: [
+                      Ping(to: "ilsabet", text: "you read the contract. good||my voice. my phone. you can say it for me 🌙", delay: 60)
                   ]),
                   Trigger(id: "tam_clouds", when: ["tam_song"], pings: [
                       Ping(to: "pip", text: "uh. the sky just went solid grey. like someone put a lid on the town||did you do that?? the crows HATE it", delay: 15),
